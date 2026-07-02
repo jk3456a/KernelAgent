@@ -52,6 +52,7 @@ def _run_strategy(
     test_code: str,
     log_dir: Path,
     max_rounds: int | None = None,
+    resume_from: Path | None = None,
 ) -> dict:
     """Run a single strategy using its config file."""
     config_path = _CONFIGS_DIR / f"{strategy}.yaml"
@@ -75,6 +76,7 @@ def _run_strategy(
         problem_file=problem_file,
         test_code=test_code,
         max_rounds=max_rounds,
+        resume_from=(resume_from / strategy) if resume_from else None,
     )
 
 
@@ -130,6 +132,13 @@ def main():
         required=True,
         help="Directory containing kernel.py, problem.py, and test.py",
     )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Prior run log dir (opt_manager_logs/...) to continue from; "
+        "seeds the strategy with its best kernel and continues round numbering",
+    )
 
     args = parser.parse_args()
 
@@ -138,7 +147,10 @@ def main():
     kernel_file = kernel_dir / "input.py"  # Use input.py as initial
     problem_file = kernel_dir / "problem.py"
     test_file = kernel_dir / "test.py"
-    log_dir = kernel_dir / "opt_manager_logs"
+    # Each run writes to its own log dir so successive runs don't overwrite each
+    # other and the dashboard can review the full history. Override with
+    # KERNEL_OPT_LOG_DIR (e.g. a timestamped path); defaults to a single dir.
+    log_dir = Path(os.environ.get("KERNEL_OPT_LOG_DIR") or (kernel_dir / "opt_manager_logs"))
 
     if not problem_file.exists():
         print(f"ERROR: problem.py not found in {kernel_dir}")
@@ -173,6 +185,7 @@ def main():
                 test_code,
                 log_dir,
                 max_rounds=args.max_rounds,
+                resume_from=args.resume_from,
             )
             print_result(results[strategy], strategy.upper(), kernel_dir)
 
@@ -192,6 +205,7 @@ def main():
             test_code,
             log_dir,
             max_rounds=args.max_rounds,
+            resume_from=args.resume_from,
         )
         print_result(result, args.strategy.upper(), kernel_dir)
 

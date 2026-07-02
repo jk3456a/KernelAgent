@@ -536,6 +536,26 @@ class OptimizationOrchestrator:
             any_verified = True
             current_attempt.config_changes = config_changes
 
+            # Record THIS round's own measured time (the bare new-kernel time),
+            # distinct from the best-so-far the revert logic keeps. Without this
+            # the trajectory shows the reverted best every round (e.g. 1.79ms x3)
+            # and it looks like nothing changed, when in fact each round tried a
+            # new kernel that was slower and got reverted.
+            import json as _json
+
+            (self.artifact_dir / f"round{round_num:03d}_result.json").write_text(
+                _json.dumps({
+                    "round": round_num,
+                    "new_time_ms": new_time if new_time != float("inf") else None,
+                    "best_so_far_ms": best_runtime_time
+                    if best_runtime_time != float("inf") else None,
+                    "improvement_pct": improvement_pct,
+                    "is_improvement": bool(new_time < best_runtime_time),
+                    "reverted": bool(new_time >= best_runtime_time),
+                }),
+                encoding="utf-8",
+            )
+
             # Add SOL metrics from new kernel profiling
             if new_kernel_metrics:
                 current_attempt.compute_sol_pct = new_kernel_metrics.get(
@@ -851,17 +871,41 @@ class OptimizationOrchestrator:
     def _generate_optimized_kernel(self, opt_prompt: str, round_num: int) -> str | None:
         """Generate optimized kernel from LLM."""
         self.logger.info(f"[{round_num}] Generating optimized kernel...")
+        failure_file = self.artifact_dir / f"round{round_num:03d}_failure.json"
         try:
             messages = [{"role": "user", "content": opt_prompt}]
             response_text = self.verification_worker._call_llm(
                 messages,
-                max_tokens=24576,
+                # Reasoning models share this budget between the reasoning trace
+                # and the emitted code; a tight cap truncates the kernel to empty.
+                # Ask big and let the provider clamp to its real limit.
+                max_tokens=1_000_000,
             )
 
             # Save response
             response_file = self.artifact_dir / f"round{round_num:03d}_opt_reply.txt"
             with open(response_file, "w") as f:
-                f.write(response_text)
+                f.write(response_text or "")
+
+            # Save the model's reasoning trace (thinking) when the provider
+            # exposed one, so the trajectory shows what it thought, not just what
+            # it wrote — invaluable for reviewing empty/failed rounds.
+            reasoning = getattr(self.verification_worker, "_last_reasoning", None)
+            if reasoning:
+                (self.artifact_dir / f"round{round_num:03d}_reasoning.txt").write_text(
+                    reasoning, encoding="utf-8"
+                )
+
+            # Classify an unusable LLM response so the trajectory can tell apart
+            # "model returned nothing" from "model wrote code that fails to
+            # compile/verify downstream". This is the gen-stage failure taxonomy.
+            if not response_text or not response_text.strip():
+                self._write_failure(
+                    failure_file, round_num, "empty_response",
+                    "LLM returned empty content (reasoning-model budget spent on "
+                    "reasoning, refusal, or truncation).",
+                )
+                return None
 
             # Extract code
             optimized_kernel = self.verification_worker._extract_code_from_response(
@@ -869,16 +913,35 @@ class OptimizationOrchestrator:
             )
 
             if not optimized_kernel or len(optimized_kernel) < 100:
-                self.logger.warning(
-                    f"[{round_num}] Failed to extract valid kernel code"
+                self._write_failure(
+                    failure_file, round_num, "no_code_block",
+                    f"LLM replied {len(response_text)} chars but no usable "
+                    "```python kernel block was extracted.",
                 )
                 return None
 
             return optimized_kernel
 
         except Exception as e:
+            self._write_failure(
+                failure_file, round_num, "request_error", f"{type(e).__name__}: {e}"
+            )
             self.logger.error(f"[{round_num}] LLM call failed: {e}")
             return None
+
+    def _write_failure(self, path, round_num: int, kind: str, detail: str) -> None:
+        """Record a structured generation-stage failure for review."""
+        import json as _json
+
+        self.logger.warning(f"[{round_num}] generation failed ({kind}): {detail}")
+        try:
+            path.write_text(
+                _json.dumps({"round": round_num, "stage": "generation",
+                             "kind": kind, "detail": detail}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def _verify_and_refine(
         self,

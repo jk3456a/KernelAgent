@@ -282,6 +282,7 @@ class OptimizationManager:
         problem_file: Path | str,
         test_code: str | list[str],
         max_rounds: int | None = None,
+        resume_from: Path | str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Run optimization with the configured strategy.
@@ -322,6 +323,23 @@ class OptimizationManager:
         )
         self.strategy.initialize(initial_entry)
 
+        # Resume: continue a prior run instead of starting fresh. We load the
+        # prior program DB, seed the strategy with its best kernel (keeping its
+        # measured time so the revert logic works), and continue the round
+        # numbering from where the prior run stopped.
+        resume_info = self._load_resume_state(resume_from) if resume_from else None
+        start_round = 1
+        if resume_info is not None:
+            initial_kernel = resume_info["kernel_code"]
+            self.strategy.initialize(resume_info["best_program"])
+            for prog in resume_info["programs"]:
+                self.database.add_program(prog)
+            start_round = resume_info["next_round"]
+            self.logger.info(
+                f"RESUMED from {resume_from}: best={resume_info['best_ms']:.4f}ms, "
+                f"continuing at round {start_round}"
+            )
+
         # Verify initial kernel correctness before investing in benchmarks/optimization
         if not self._verify_initial_kernel(initial_kernel, problem_file, test_code):
             return {
@@ -333,22 +351,46 @@ class OptimizationManager:
                 "error": "Initial kernel failed correctness verification",
             }
 
+        # Benchmark the initial kernel first. Under remote execution this writes
+        # initial_kernel.py to the artifacts dir, which the remote PyTorch
+        # baseline reuses to drive kernel_subprocess.py --baseline (it needs a
+        # kernel alongside the problem). Order matters: baseline must come after.
+        initial_kernel_time = self._benchmark_initial_kernel(
+            initial_kernel, problem_file
+        )
+
         # Benchmark PyTorch baseline once (before spawning workers)
         pytorch_baseline = self._benchmark_pytorch_baseline(problem_file)
 
         # Benchmark torch.compile baseline
         pytorch_compile_time = self._benchmark_pytorch_compile(problem_file)
 
-        # Benchmark the initial kernel
-        initial_kernel_time = self._benchmark_initial_kernel(
-            initial_kernel, problem_file
+        # Trajectory log spanning the whole optimization run (one record per
+        # baseline + round), written at the MANAGER level so it follows the
+        # real round loop below — read by the optimization dashboard.
+        from triton_kernel_agent.opt_worker_component.searching.trajectory import (
+            TrajectoryWriter,
         )
 
-        # Round loop
-        round_num = 0
-        for round_num in range(1, max_rounds + 1):
+        trajectory = TrajectoryWriter(self.log_dir / "trajectory.jsonl")
+        trajectory.record_baseline(
+            time_ms=initial_kernel_time,
+            pytorch_ms=pytorch_baseline,
+            sol_pct=0.0,
+            bottleneck="unknown",
+        )
+        if resume_info is not None:
+            trajectory.record_resume(
+                resumed_from=str(resume_from),
+                from_round=resume_info["next_round"] - 1,
+                best_ms=resume_info["best_ms"],
+            )
+
+        # Round loop — continue numbering from start_round when resuming.
+        round_num = start_round - 1
+        for round_num in range(start_round, start_round + max_rounds):
             self.logger.info("")
-            self.logger.info(f"{'=' * 20} ROUND {round_num}/{max_rounds} {'=' * 20}")
+            self.logger.info(f"{'=' * 20} ROUND {round_num} {'=' * 20}")
 
             # 1. Get candidates from strategy
             candidates = self.strategy.select_candidates(round_num)
@@ -376,10 +418,19 @@ class OptimizationManager:
                     f"Round {round_num} best: worker {best['worker_id']} at {best['time_ms']:.4f} ms"
                 )
             else:
+                best = None
                 self.logger.info(f"Round {round_num}: no successful workers")
 
+            # Append this round to the trajectory. ``attempt`` (when present)
+            # carries the SOL / bottleneck / config detail the worker measured.
+            self._record_round_trajectory(
+                trajectory, round_num, best, initial_kernel_time
+            )
+
             # 4. Check termination
-            if self.strategy.should_terminate(round_num, max_rounds):
+            if self.strategy.should_terminate(
+                round_num, start_round + max_rounds - 1
+            ):
                 self.logger.info("Strategy signaled termination")
                 break
 
@@ -441,6 +492,101 @@ class OptimizationManager:
     ) -> float:
         """Benchmark the initial kernel before optimization begins."""
         return self.benchmarker.benchmark_kernel(initial_kernel, problem_file)
+
+    def _load_resume_state(self, resume_from: Path | str) -> dict[str, Any] | None:
+        """Load a prior run's state so optimization can continue from it.
+
+        *resume_from* is a prior run's strategy dir (the one holding
+        ``program_db.json`` and ``trajectory.jsonl``), or its parent. Returns
+        the best program to seed the strategy with, all prior programs to
+        re-seed the database, the next round number, or None if nothing usable.
+        """
+        base = Path(resume_from)
+        db_path = base / "program_db.json"
+        if not db_path.exists():
+            # allow passing the run root; find the single strategy subdir's db
+            cands = list(base.glob("*/program_db.json"))
+            if not cands:
+                self.logger.warning(f"resume: no program_db.json under {base}")
+                return None
+            db_path = cands[0]
+
+        db = JSONProgramDatabase(db_path)
+        db.load()
+        programs = list(db.programs.values())
+        finite = [p for p in programs if p.metrics.time_ms != float("inf")]
+        if not finite:
+            self.logger.warning(f"resume: no benchmarked programs in {db_path}")
+            return None
+        best = min(finite, key=lambda p: p.metrics.time_ms)
+
+        # Continue round numbering past the prior run's last round. program_id
+        # is like "r2_w0"; the generation field also carries the round.
+        last_round = max((p.generation for p in programs), default=0)
+        for p in programs:
+            pid = p.program_id
+            if pid.startswith("r") and "_" in pid:
+                try:
+                    last_round = max(last_round, int(pid[1:].split("_")[0]))
+                except ValueError:
+                    pass
+
+        return {
+            "kernel_code": best.kernel_code,
+            "best_program": best,
+            "best_ms": best.metrics.time_ms,
+            "programs": programs,
+            "next_round": last_round + 1,
+        }
+
+    @staticmethod
+    def _record_round_trajectory(trajectory, round_num, best, baseline_ms):
+        """Append one trajectory record for a finished round.
+
+        ``best`` is the winning worker result for the round (or None when no
+        worker succeeded). When present, its ``attempt`` dict carries the
+        SOL / bottleneck / config detail the optimization worker measured.
+        """
+        if best is None:
+            trajectory.record_round(
+                round_num=round_num,
+                time_ms=float("inf"),
+                baseline_ms=baseline_ms,
+                improvement_pct=0.0,
+                compute_sol_pct=0.0,
+                memory_sol_pct=0.0,
+                combined_sol_pct=0.0,
+                bottleneck="no_successful_worker",
+                config_changes={},
+                is_improvement=False,
+                is_best=False,
+                verified=False,
+                kernel_file=None,
+            )
+            return
+
+        attempt = best.get("attempt") or {}
+        time_ms = best.get("time_ms", float("inf"))
+        improvement = (
+            ((baseline_ms - time_ms) / baseline_ms * 100.0)
+            if baseline_ms and time_ms not in (None, float("inf")) and baseline_ms > 0
+            else 0.0
+        )
+        trajectory.record_round(
+            round_num=round_num,
+            time_ms=time_ms,
+            baseline_ms=baseline_ms,
+            improvement_pct=improvement,
+            compute_sol_pct=attempt.get("compute_sol_pct", 0.0),
+            memory_sol_pct=attempt.get("memory_sol_pct", 0.0),
+            combined_sol_pct=attempt.get("combined_sol_pct", 0.0),
+            bottleneck=attempt.get("bottleneck_category", "unknown"),
+            config_changes=attempt.get("config_changes", {}),
+            is_improvement=bool(time_ms not in (None, float("inf")) and time_ms < baseline_ms),
+            is_best=True,
+            verified=True,
+            kernel_file=None,
+        )
 
     def _benchmark_pytorch_compile(self, problem_file: Path) -> float:
         """Benchmark the compiler-optimized reference."""
