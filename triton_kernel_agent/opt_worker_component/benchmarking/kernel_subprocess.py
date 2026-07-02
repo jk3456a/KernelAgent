@@ -161,7 +161,7 @@ def _load_problem(
             else Model().to(device=device, dtype=dtype)
         )
         baseline_model.eval()
-        out = _run_once(baseline_model, inputs, [], "Reference")
+        out = _run_once(lambda: baseline_model(*inputs), "Reference")
         if not args.quiet:
             print(f"Reference output shape: {out.shape}, dtype: {out.dtype}")
             print()
