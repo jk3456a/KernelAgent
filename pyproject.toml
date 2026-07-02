@@ -34,6 +34,7 @@ dependencies = [
     "requests",
     "numpy",
     "omegaconf",
+    "tomli; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -41,13 +42,19 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov",
 ]
+dashboard = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+]
 
 [project.scripts]
 fuser-ui = "scripts.fuser_ui:main"
 kernel-agent = "scripts.triton_ui:main"
 list-models = "scripts.list_models:main"
 optimization-ui = "scripts.optimization_ui:main"
+optimization-dashboard = "scripts.optimization_dashboard:main"
 pipeline-ui = "scripts.pipeline_ui:main"
+devspace-heartbeat = "scripts.devspace_heartbeat:main"
 
 [project.urls]
 "Homepage" = "https://github.com/pytorch-labs/KernelAgent"
