@@ -80,6 +80,24 @@ Analyze the NCU metrics and identify {num_bottlenecks} performance bottleneck(s)
 - **compute**: Compute throughput is the limiting factor
 - **underutilized**: Neither saturated (<60% both), indicating stalls/occupancy issues
 
+## Optimization technique guidance
+When a tensor-core kernel (GEMM/conv/attention) shows LOW tensor-pipe SOL
+(sm__pipe_tensor_cycles_active) AND low DRAM throughput, the tensor cores are
+STARVED — data is not reaching them fast enough. This is NOT solved by only
+shrinking BLOCK_SIZE / lowering num_warps for occupancy; those tweaks plateau
+quickly. The high-leverage fixes to recommend are:
+- **TMA (Tensor Memory Accelerator)**: async bulk copies of A/B tiles that
+  overlap global-memory load with tensor-core compute (Hopper `cp.async.bulk` /
+  `tl.load` via TMA descriptors). This is usually the single biggest win for a
+  starved GEMM.
+- **Deeper software pipelining**: raise `num_stages` (3→4/5) so tile loads for
+  future K-iterations run while the current `tl.dot` executes.
+- **Persistent kernel + L2-aware tile swizzling**: one block per SM looping over
+  output tiles, grouped (super-tile) ordering to maximize L2 reuse.
+- **Larger K tiles**: tiny BLOCK_SIZE_K (e.g. 32) causes excessive small L1
+  round-trips; prefer BLOCK_SIZE_K >= 64.
+Prefer these structural fixes over pure occupancy tuning when tensor SOL is low.
+
 ## GPU Specifications
 {gpu_specs}
 

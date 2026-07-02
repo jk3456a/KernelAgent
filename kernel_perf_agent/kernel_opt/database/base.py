@@ -132,7 +132,20 @@ class OptHierarchy:
                 optnode_persistence,
             ],
         )
-        add_relation(optnode_utilization, [optnode_persistence])
+        # "underutilized" kernels (tensor cores starved, low occupancy) are most
+        # often fixed by feeding the compute units better: async TMA copies to
+        # overlap load with compute, PID swizzling for L2 reuse, and persistent
+        # kernels. Previously this only pointed at persistence, so an
+        # underutilized GEMM could never retrieve the TMA patterns it needs.
+        add_relation(
+            optnode_utilization,
+            [
+                optnode_host_TMA,
+                optnode_device_TMA,
+                optnode_PID_swizzling,
+                optnode_persistence,
+            ],
+        )
 
         # Level 3 nodes - code examples
         optnode_matmul = OptNode(

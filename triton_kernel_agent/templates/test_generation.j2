@@ -90,13 +90,21 @@ DEBUGGING REQUIREMENTS:
 - Include try/except blocks around numerical comparisons to catch and debug assertion errors
 
 NUMERICAL TOLERANCE REQUIREMENTS:
-- Use DEFAULT tolerances: rtol=1e-3, atol=1e-3 for torch.allclose()
-- Adjust tolerances ONLY if needed based on:
-  - Input data type (float16 and bfloat16 may need looser tolerances like rtol=1e-2, atol=2e-2)
-  - Input value ranges (very large or very small values may need adjusted tolerances)
-  - Specific algorithm characteristics (iterative algorithms may accumulate more error)
-  - If accumulation dimension is very large, use much larger tolerances, like 1e-1
-- Always document in comments why non-default tolerances are used
+- Compare with torch.allclose(result, expected, rtol=..., atol=...) ONLY.
+  NEVER gate correctness on a max-relative-error metric like
+  max(|result-expected| / (|expected|+eps)): near-zero reference elements blow
+  that ratio up and reject numerically-correct kernels. torch.allclose already
+  combines absolute and relative terms correctly.
+- Use DEFAULT tolerances: rtol=1e-2, atol=1e-2 for torch.allclose() (this
+  matches the KernelBench / torchbench and AutoLoopHarness GEMM correctness
+  gates; tighter values like 1e-3 spuriously fail correct float32 matmuls with
+  large accumulation depth).
+- Do NOT raise rtol above 1e-2 — that is the upper bound used by both
+  KernelBench (bf16) and the AutoLoopHarness fp16-GEMM gate. For large
+  accumulation depth, the absolute term (atol) already absorbs the extra
+  rounding; raise atol modestly if needed, never rtol.
+- float16 / bfloat16 may use atol=2e-2; document any non-default value in a
+  comment.
 
 IMPORTANT: Do NOT use any Triton kernel launch syntax. Treat kernel_function as a regular Python function.
 

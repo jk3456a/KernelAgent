@@ -39,7 +39,7 @@ NCU_ROOFLINE_METRICS = [
     "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",  # Memory SOL
     "sm__throughput.avg.pct_of_peak_sustained_elapsed",  # Compute SOL
     # Tensor core detection
-    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
 ]
 
 
@@ -102,7 +102,7 @@ class RooflineAnalyzer:
     def _is_using_tensor_cores(self, ncu_metrics: dict[str, Any]) -> bool:
         """Detect tensor core usage from NCU metrics."""
         tc_cycles = ncu_metrics.get(
-            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", 0
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", 0
         )
         return tc_cycles > self.config.tensor_core_threshold
 
@@ -124,6 +124,21 @@ class RooflineAnalyzer:
             return "memory"
         else:
             return "compute"
+
+    def _classify_tensor_bottleneck(self, tensor_sol: float, memory_sol: float) -> str:
+        """Classify the bottleneck for a tensor-core kernel.
+
+        Low tensor utilization with low DRAM means the tensor pipe is starved —
+        the kernel is not feeding the tensor cores (no TMA / poor pipelining /
+        bad tile shape), which is a compute(tensor)-bound problem, NOT memory.
+        Only call it memory-bound when DRAM is genuinely the saturated resource.
+        """
+        threshold = self.config.underutilized_threshold
+        if tensor_sol < threshold and memory_sol < threshold:
+            return "underutilized"
+        if memory_sol > tensor_sol:
+            return "memory"
+        return "compute"
 
     def analyze(
         self,
@@ -170,14 +185,39 @@ class RooflineAnalyzer:
         compute_sol = ncu_metrics.get(compute_key, 0)
         memory_sol = ncu_metrics.get(memory_key, 0)
 
-        # Primary efficiency: use max of compute/memory
-        efficiency = max(compute_sol, memory_sol)
-
         # Tensor core detection
         uses_tc = self._is_using_tensor_cores(ncu_metrics)
 
-        # Classify bottleneck
-        bottleneck = self._classify_bottleneck(compute_sol, memory_sol)
+        # Primary efficiency.
+        #
+        # For tensor-core kernels (GEMM, conv, attention), the meaningful "speed
+        # of light" is tensor-pipe utilization. A naive GEMM saturates the
+        # shared-memory subsystem, so gpu__compute_memory_throughput reads ~76%
+        # while the tensor cores run at ~7%; max(compute, memory) would then
+        # report ~79% and make the optimizer stop with a 7%-MFU kernel. So when
+        # the tensor pipe is active we use the tensor SOL as the efficiency, which
+        # exposes the real headroom. Non-tensor kernels keep the original
+        # max(compute, memory) behavior.
+        tensor_sol = ncu_metrics.get(
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", 0
+        )
+        if uses_tc:
+            efficiency = tensor_sol
+        else:
+            efficiency = max(compute_sol, memory_sol)
+
+        # Classify bottleneck. For tensor-core kernels, low tensor utilization
+        # means the tensor pipe is starved (compute-bound on tensor cores), not
+        # DRAM-bound — never call it "memory" when DRAM SOL is low. Use the REAL
+        # DRAM throughput here, not gpu__compute_memory_throughput (which folds in
+        # the shared-memory subsystem and is exactly what mislabeled this kernel).
+        if uses_tc:
+            dram_sol = ncu_metrics.get(
+                "dram__throughput.avg.pct_of_peak_sustained_elapsed", 0
+            )
+            bottleneck = self._classify_tensor_bottleneck(tensor_sol, dram_sol)
+        else:
+            bottleneck = self._classify_bottleneck(compute_sol, memory_sol)
 
         # Check if at roofline
         at_roofline = efficiency >= self.config.threshold_pct
