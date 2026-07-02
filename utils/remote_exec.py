@@ -104,7 +104,7 @@ def _build_remote_script(
         f'export TRITON_CACHE_DIR={_TRITON_CACHE} '
         f'TORCHINDUCTOR_CACHE_DIR={_INDUCTOR_CACHE} && '
         f'cd {remote_workdir} && '
-        f'exec setsid env {env_prefix} {py}'
+        f'exec setsid --wait env {env_prefix} {py}'
     )
 
 
@@ -199,7 +199,7 @@ def _build_workdir_test_script(remote_workdir: str, test_filenames: list[str]) -
         f'export TRITON_CACHE_DIR={_TRITON_CACHE} '
         f'TORCHINDUCTOR_CACHE_DIR={_INDUCTOR_CACHE} && '
         f'cd {remote_workdir} && '
-        f'exec setsid env {env_prefix} bash -c {shlex.quote(chain)}'
+        f'exec setsid --wait env {env_prefix} bash -c {shlex.quote(chain)}'
     )
 
 
@@ -246,7 +246,7 @@ def _build_command_script(remote_workdir: str, command: str) -> str:
         f'export TRITON_CACHE_DIR={_TRITON_CACHE} '
         f'TORCHINDUCTOR_CACHE_DIR={_INDUCTOR_CACHE} && '
         f'cd {remote_workdir} && '
-        f'exec setsid env {env_prefix} bash -c {shlex.quote(command)}'
+        f'exec setsid --wait env {env_prefix} bash -c {shlex.quote(command)}'
     )
 
 
