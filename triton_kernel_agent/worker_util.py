@@ -231,9 +231,11 @@ def _run_test_multiprocess(
     # giving each child a clean process.
     ctx = mp.get_context("spawn")
     stdout, stderr = "", ""
+    ran_any = False
     for test_file in test_files:
         if not test_file.exists():
             continue
+        ran_any = True
         result_queue = ctx.Queue()
         process = ctx.Process(
             target=_run_test_process,
@@ -270,5 +272,13 @@ def _run_test_multiprocess(
             )
             logger.error(error_msg)
             return False, "", error_msg
+
+    if not ran_any:
+        error_msg = (
+            "No runnable test files: verification cannot report success "
+            "when nothing was executed."
+        )
+        logger.error(error_msg)
+        return False, "", error_msg
 
     return True, stdout, stderr
