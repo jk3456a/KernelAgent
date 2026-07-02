@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+remote.toml
 
 # Python
 __pycache__/
@@ -118,6 +119,10 @@ triton_kernel_logs/
 session_*/
 worker_*/
 .fuse/
+opt_manager_logs/
+# Optimization run artifacts under examples (logs, trajectories, benchmark dumps)
+examples/**/runs/
+examples/**/runs_*/
 
 # Generated kernels
 kernel.py
