@@ -129,6 +129,8 @@ kernel.py
 test_kernel.py
 final_test.py
 *_kernel.py
+# agent1-generated initial kernel written into example dirs by the pipeline runners
+examples/**/input.py
 
 # IDE
 .vscode/
