@@ -25,6 +25,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from utils import remote_config, remote_exec
 from Fuser.runner_util import _run_candidate_multiprocess
 
 STDOUT_MAX_TAIL = 20000  # bytes
@@ -245,23 +246,26 @@ def run_candidate(
     t_started = time.time()
     (run_dir / "EXEC_STARTED").write_text(str(t_started), encoding="utf-8")
 
-    # Run the candidate (via subprocess or multiprocess)
-    rc, t_finished = (
-        _run_candidate(
+    # Resolve where the candidate runs. kind="local" keeps the original local
+    # subprocess path; kind="ssh" rsyncs the run dir to a remote GPU host and
+    # executes it over ssh, reusing the same _run_candidate Popen loop so that
+    # timeout / cancel / capture / classification are identical either way.
+    remote_cfg = remote_config.load_remote_config()
+    if remote_config.is_remote_enabled(remote_cfg):
+        sources = [code_dst]
+        if deny_network:
+            sources.append(run_dir / "sitecustomize.py")
+        ssh_argv = remote_exec.build_remote_argv(
+            remote_cfg,
             run_dir,
-            argv,
-            env,
-            stdout_path,
-            stderr_path,
-            t_started,
-            timeout_s,
-            cancel_event,
-        )
-        if os.getenv("FUSER_COMPOSE_USE_SYS_EXECUTABLE", "1") == "1"
-        else _run_candidate_multiprocess(
             exec_filename,
+            sources,
+            isolated=isolated,
+            deny_network=deny_network,
+        )
+        rc, t_finished = _run_candidate(
             run_dir,
-            argv,
+            ssh_argv,
             env,
             stdout_path,
             stderr_path,
@@ -269,7 +273,32 @@ def run_candidate(
             timeout_s,
             cancel_event,
         )
-    )
+    else:
+        # Run the candidate (via subprocess or multiprocess)
+        rc, t_finished = (
+            _run_candidate(
+                run_dir,
+                argv,
+                env,
+                stdout_path,
+                stderr_path,
+                t_started,
+                timeout_s,
+                cancel_event,
+            )
+            if os.getenv("FUSER_COMPOSE_USE_SYS_EXECUTABLE", "1") == "1"
+            else _run_candidate_multiprocess(
+                exec_filename,
+                run_dir,
+                argv,
+                env,
+                stdout_path,
+                stderr_path,
+                t_started,
+                timeout_s,
+                cancel_event,
+            )
+        )
 
     # Read bounded scan for classification
     out_text, scan_truncated = _read_all_text_bounded(stdout_path, MAX_SCAN_BYTES)

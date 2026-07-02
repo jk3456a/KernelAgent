@@ -29,6 +29,7 @@ from typing import Any
 
 from triton_kernel_agent.platform_config import get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
+from utils import remote_config, remote_exec
 from utils.providers import get_model_provider
 
 from .prompt_manager import PromptManager
@@ -331,6 +332,26 @@ class VerificationWorker:
         Returns:
             Tuple of (success, stdout, stderr)
         """
+        # When a remote target is configured (kind="ssh"), the GPU lives on the
+        # remote host: rsync the workdir (kernel + tests) there and run the
+        # tests over ssh, returning the same (success, stdout, stderr) contract.
+        remote_cfg = remote_config.load_remote_config()
+        if remote_config.is_remote_enabled(remote_cfg):
+            test_names = [t.name for t in self.test_files if t.exists()]
+            if not test_names:
+                return True, "", ""
+            try:
+                return remote_exec.run_workdir_tests(
+                    remote_cfg, self.workdir, test_names, timeout_s=self.test_timeout_s
+                )
+            except subprocess.TimeoutExpired:
+                self.logger.error("Remote test timed out")
+                return (
+                    False,
+                    "",
+                    f"Remote test execution timed out after {self.test_timeout_s} seconds",
+                )
+
         try:
             for test_file in self.test_files:
                 if not test_file.exists():
@@ -384,6 +405,10 @@ class VerificationWorker:
             kwargs["high_reasoning_effort"] = True
 
         response = self.provider.get_response(self.openai_model, messages, **kwargs)
+        # Stash the reasoning trace (GLM/o-series chain-of-thought) so callers can
+        # persist it without changing this method's string return contract.
+        self._last_reasoning = getattr(response, "reasoning", None)
+        self._last_finish_reason = getattr(response, "finish_reason", None)
         return response.content
 
     def _refine_kernel(

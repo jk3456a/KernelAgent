@@ -25,16 +25,16 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-import torch
+from utils import remote_config, remote_exec
 
-from triton_kernel_agent.opt_worker_component.benchmarking.timing import (
-    compute_timing_stats,
-    prepare_pytorch_model,
-    time_with_cuda_events,
-    time_with_triton_do_bench,
-)
+# ``torch`` and the in-process timing helpers are imported lazily inside the
+# methods that need them. When a remote target is configured (kind="ssh") the
+# GPU lives on the remote host and this process never touches torch, so a
+# torch-free control machine can still drive the optimization loop.
+if TYPE_CHECKING:
+    import torch
 
 
 class BenchmarkLockManager:
@@ -130,6 +130,12 @@ class Benchmark:
                 results_json = self.artifacts_dir / "benchmark_results.json"
                 benchmark_script = Path(__file__).parent / "kernel_subprocess.py"
 
+                remote_cfg = remote_config.load_remote_config()
+                if remote_config.is_remote_enabled(remote_cfg):
+                    return self._benchmark_kernel_remote(
+                        remote_cfg, kernel_file, problem_file, baseline_file
+                    )
+
                 # Use KERNEL_PROFILER_PYTHON (the PAR bootstrap) when set, like
                 # ncu_profiler.py; bare sys.executable is un-bootstrapped in a PAR.
                 bench_python = (
@@ -186,10 +192,64 @@ class Benchmark:
             self.logger.error(f"Kernel benchmark failed: {e}")
             return {"time_ms": float("inf"), "speedup": 0.0}
 
+    def _benchmark_kernel_remote(
+        self,
+        remote_cfg: dict[str, str],
+        kernel_file: Path,
+        problem_file: Path,
+        baseline_file: Optional[Path],
+    ) -> dict[str, Any]:
+        """Benchmark a kernel on the remote GPU host.
+
+        Pushes ``kernel_subprocess.py`` + the kernel + the problem into a remote
+        workdir, runs the benchmark there, and pulls ``benchmark_results.json``
+        back so the local parsing path is unchanged.
+
+        The caller (``benchmark_kernel``) already holds ``self.lock_manager``; the
+        lock serializes *local* GPU access and must NOT be re-acquired here (it is
+        non-reentrant — doing so deadlocks). Remote GPU contention is handled on
+        the remote host, so running unlocked here is correct.
+        """
+        workdir = self.artifacts_dir / f"remote_bench_{kernel_file.stem}"
+        workdir.mkdir(parents=True, exist_ok=True)
+        bench_script = Path(__file__).parent / "kernel_subprocess.py"
+        timing_mod = Path(__file__).parent / "timing.py"
+        for src in (bench_script, timing_mod, kernel_file, problem_file):
+            (workdir / src.name).write_bytes(src.read_bytes())
+
+        results_name = "benchmark_results.json"
+        command = (
+            f"python3 -u {bench_script.name} "
+            f"--problem {problem_file.name} --kernel {kernel_file.name} "
+            f"--warmup {self.warmup} --repeat {self.repeat} "
+            f"--json {results_name} --quiet"
+        )
+        if baseline_file:
+            command += " --baseline"
+
+        rc, out, err = remote_exec.run_command_with_artifacts(
+            remote_cfg, workdir, command, artifacts=[results_name], timeout_s=300
+        )
+        results_json = workdir / results_name
+        if rc != 0 or not results_json.exists():
+            self.logger.error(
+                f"Remote kernel benchmark failed (rc={rc}): {(err or out).strip()[:500]}"
+            )
+            return {"time_ms": float("inf"), "speedup": 0.0}
+
+        with open(results_json, "r") as f:
+            results = json.load(f)
+        kernel_results = results.get("kernels", {}).get(kernel_file.stem, {})
+        return {
+            "time_ms": kernel_results.get("time_ms", float("inf")),
+            "speedup": kernel_results.get("speedup", 1.0),
+        }
+
     def benchmark_pytorch(
         self,
         problem_file: Path,
-        dtype: Optional[torch.dtype] = None,
+        dtype: Optional["torch.dtype"] = None,
+        kernel_file: Optional[Path] = None,
     ) -> dict[str, Any]:
         """Benchmark PyTorch baseline using direct in-process timing.
 
@@ -198,12 +258,25 @@ class Benchmark:
         Args:
             problem_file: Path to problem file (must define Model class and get_inputs())
             dtype: Data type to use (default: auto-detect based on model parameters)
+            kernel_file: Optional kernel file used only by the remote path to drive
+                ``kernel_subprocess.py --baseline`` (the GPU lives on the remote host).
 
         Returns:
             Dictionary with benchmark results:
                 - time_ms: Mean time in ms
                 - stats: Full timing statistics (mean, std, min, max, all_times, etc.)
         """
+        remote_cfg = remote_config.load_remote_config()
+        if remote_config.is_remote_enabled(remote_cfg):
+            return self._benchmark_pytorch_remote(remote_cfg, problem_file, kernel_file)
+
+        from triton_kernel_agent.opt_worker_component.benchmarking.timing import (
+            compute_timing_stats,
+            prepare_pytorch_model,
+            time_with_cuda_events,
+            time_with_triton_do_bench,
+        )
+
         try:
             with self.lock_manager:
                 model, inputs = prepare_pytorch_model(
@@ -242,10 +315,59 @@ class Benchmark:
             self.logger.error(traceback.format_exc())
             return {"time_ms": float("inf")}
 
+    def _benchmark_pytorch_remote(
+        self,
+        remote_cfg: dict[str, str],
+        problem_file: Path,
+        kernel_file: Optional[Path],
+    ) -> dict[str, Any]:
+        """PyTorch baseline timing on the remote GPU host.
+
+        ``kernel_subprocess.py --baseline`` times the PyTorch reference alongside
+        the kernel and reports it under ``kernels.pytorch_reference``. We need a
+        kernel to drive it; the orchestrator's round-0 kernel is the natural
+        choice and is passed through ``kernel_file``.
+        """
+        if kernel_file is None or not kernel_file.exists():
+            self.logger.error(
+                "Remote PyTorch baseline requires a kernel_file to drive "
+                "kernel_subprocess.py --baseline; none was provided."
+            )
+            return {"time_ms": float("inf")}
+
+        with self.lock_manager:
+            workdir = self.artifacts_dir / "remote_bench_pytorch"
+            workdir.mkdir(parents=True, exist_ok=True)
+            bench_script = Path(__file__).parent / "kernel_subprocess.py"
+            timing_mod = Path(__file__).parent / "timing.py"
+            for src in (bench_script, timing_mod, kernel_file, problem_file):
+                (workdir / src.name).write_bytes(src.read_bytes())
+
+            results_name = "pytorch_baseline.json"
+            command = (
+                f"python3 -u {bench_script.name} "
+                f"--problem {problem_file.name} --kernel {kernel_file.name} "
+                f"--warmup {self.warmup} --repeat {self.repeat} "
+                f"--json {results_name} --baseline --quiet"
+            )
+            rc, out, err = remote_exec.run_command_with_artifacts(
+                remote_cfg, workdir, command, artifacts=[results_name], timeout_s=300
+            )
+            results_json = workdir / results_name
+            if rc != 0 or not results_json.exists():
+                self.logger.error(
+                    f"Remote PyTorch baseline failed (rc={rc}): {(err or out).strip()[:500]}"
+                )
+                return {"time_ms": float("inf")}
+            with open(results_json, "r") as f:
+                results = json.load(f)
+            ref = results.get("kernels", {}).get("pytorch_reference", {})
+            return {"time_ms": ref.get("time_ms", float("inf"))}
+
     def benchmark_pytorch_compile(
         self,
         problem_file: Path,
-        dtype: Optional[torch.dtype] = None,
+        dtype: Optional["torch.dtype"] = None,
     ) -> dict[str, Any]:
         """Benchmark torch.compile'd PyTorch baseline using direct in-process timing.
 
@@ -262,6 +384,26 @@ class Benchmark:
                 - time_ms: Mean time in ms
                 - stats: Full timing statistics (mean, std, min, max, all_times, etc.)
         """
+        remote_cfg = remote_config.load_remote_config()
+        if remote_config.is_remote_enabled(remote_cfg):
+            # torch.compile baseline is an informational reference line, not part
+            # of the optimization loop, and kernel_subprocess.py has no compile
+            # path. Skip it gracefully on remote rather than ship a new script.
+            self.logger.info(
+                "Skipping torch.compile baseline under remote execution "
+                "(informational reference only)."
+            )
+            return {"time_ms": float("inf")}
+
+        from triton_kernel_agent.opt_worker_component.benchmarking.timing import (
+            compute_timing_stats,
+            prepare_pytorch_model,
+            time_with_cuda_events,
+            time_with_triton_do_bench,
+        )
+
+        import torch
+
         try:
             with self.lock_manager:
                 model, inputs = prepare_pytorch_model(

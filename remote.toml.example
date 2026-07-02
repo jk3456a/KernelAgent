@@ -1,0 +1,27 @@
+# KernelAgent remote-execution config (ported from Train_engine config/remote).
+#
+# Copy this file to ./remote.toml (the repo / run CWD) and fill in `hostname`,
+# OR point KERNEL_REMOTE_CONFIG at it, OR skip the file entirely and set the
+# KERNEL_REMOTE_* environment variables. Env vars override the TOML per field.
+#
+# When kind = "ssh", candidate kernels are rsync'd to the remote host and run
+# over `ssh <hostname>` — this machine only needs the LLM keys, the remote host
+# owns the GPU + torch/triton install.
+#
+# Pre-conditions for kind = "ssh" (identical to Train_engine):
+#   1. ~/.ssh/config has the `hostname` alias configured (proxy / cert / port /
+#      identity) so plain `ssh <hostname> <cmd>` works without extra flags.
+#   2. rsync 3.x on the remote non-interactive $PATH.
+#   3. torch + triton importable on the remote default `python3`.
+#
+# Field semantics:
+#   * kind      — "local" (default; run candidates locally) or "ssh".
+#   * hostname  — the SSH alias the harness connects to (required for ssh).
+#   * workspace — parent dir on the remote that holds per-run workdirs. Empty
+#                 defaults to the remote $HOME. Candidates run under
+#                 <workspace>/.kernelagent_remote/<attempt_id>/.
+
+[remote]
+kind = "ssh"
+hostname = ""
+workspace = ""

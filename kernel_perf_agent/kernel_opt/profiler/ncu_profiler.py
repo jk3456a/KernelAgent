@@ -85,6 +85,72 @@ class MetricSelectionPolicy(Enum):
     MAX_CYCLES = "max_cycles"
 
 
+def _profile_triton_kernel_remote(
+    remote_cfg: dict,
+    *,
+    benchmark_script: Path,
+    workdir: Path,
+    out_csv: str,
+    kernel_file: Optional[Path],
+    problem_file: Optional[Path],
+    launch_count: int,
+    launch_skip: int,
+    timeout: int,
+) -> Path:
+    """Run NCU profiling on the remote GPU host and pull the CSV back.
+
+    The Jinja-rendered wrapper hard-codes the kernel/problem parent dirs as
+    absolute local paths in ``sys.path.insert(...)``. On the remote those paths
+    don't exist, so we rewrite both to ``"."`` — the wrapper, kernel, and problem
+    all live in the same pushed workdir, and ncu runs with that workdir as cwd,
+    so a relative import path resolves them.
+    """
+    from utils import remote_exec
+
+    if kernel_file is None or problem_file is None:
+        raise RuntimeError(
+            "Remote NCU profiling requires kernel_file and problem_file so they "
+            "can be pushed alongside the wrapper; the profiler must pass them."
+        )
+
+    remote_dir = workdir / f"remote_ncu_{benchmark_script.stem}"
+    remote_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rewrite the wrapper's hard-coded local parent paths to the remote workdir.
+    wrapper_src = benchmark_script.read_text(encoding="utf-8")
+    wrapper_src = wrapper_src.replace(repr(str(kernel_file.parent)), repr("."))
+    wrapper_src = wrapper_src.replace(repr(str(problem_file.parent)), repr("."))
+    wrapper_name = "ncu_wrapper.py"
+    (remote_dir / wrapper_name).write_text(wrapper_src, encoding="utf-8")
+    (remote_dir / kernel_file.name).write_bytes(kernel_file.read_bytes())
+    (remote_dir / problem_file.name).write_bytes(problem_file.read_bytes())
+
+    # Build the remote ncu command (runs in the pushed workdir). ncu is on the
+    # remote PATH (verified: /usr/local/bin/ncu, root, no sudo needed).
+    ncu_cmd = (
+        f"ncu --csv --page=raw --kernel-name-base=demangled "
+        f"--target-processes=all --replay-mode=kernel --profile-from-start=on "
+        f"--log-file={out_csv} --metrics={METRICS} "
+        f"--launch-skip={launch_skip} --launch-count={launch_count} "
+        f"python3 {wrapper_name}"
+    )
+
+    rc, out, err = remote_exec.run_command_with_artifacts(
+        remote_cfg, remote_dir, ncu_cmd, artifacts=[out_csv], timeout_s=timeout
+    )
+
+    csv_path = remote_dir / out_csv
+    if rc != 0:
+        raise RuntimeError(
+            f"Remote NCU profiling failed (rc={rc}):\n{(err or out).strip()[:500]}"
+        )
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Remote NCU did not return CSV: {csv_path}")
+    if csv_path.stat().st_size < 100:
+        raise RuntimeError(f"Remote NCU CSV too small ({csv_path.stat().st_size} bytes)")
+    return csv_path
+
+
 def profile_triton_kernel(
     benchmark_script: Path,
     workdir: Path,
@@ -95,6 +161,8 @@ def profile_triton_kernel(
     launch_skip: int = 10,
     timeout: int = 360,
     use_sudo: bool = False,
+    kernel_file: Optional[Path] = None,
+    problem_file: Optional[Path] = None,
 ) -> Path:
     """
     Profile a Triton kernel using NCU.
@@ -120,6 +188,26 @@ def profile_triton_kernel(
     """
     # Check for environment variable override
     use_sudo = use_sudo or os.environ.get("KERNELAGENT_NCU_USE_SUDO", "0") == "1"
+
+    # Remote execution: when a remote target is configured (kind="ssh"), the GPU
+    # and ncu live on the remote host. Push the wrapper + kernel + problem to a
+    # remote workdir, run ncu there, and pull the CSV back. The local control
+    # machine needs neither a GPU nor torch/ncu.
+    from utils import remote_config
+
+    remote_cfg = remote_config.load_remote_config()
+    if remote_config.is_remote_enabled(remote_cfg):
+        return _profile_triton_kernel_remote(
+            remote_cfg,
+            benchmark_script=benchmark_script,
+            workdir=workdir,
+            out_csv=out_csv,
+            kernel_file=kernel_file,
+            problem_file=problem_file,
+            launch_count=launch_count,
+            launch_skip=launch_skip,
+            timeout=timeout,
+        )
 
     # Resolve paths
     if python_executable is None:

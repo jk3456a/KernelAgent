@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 import shutil
 import time
 import traceback
@@ -152,7 +153,13 @@ class NvidiaBenchmarker(KernelBenchmarker):
         problem_file: Path,
     ) -> float:
         benchmarker = self._get_benchmarker()
-        result = benchmarker.benchmark_pytorch(problem_file)
+        # The remote PyTorch-baseline path drives kernel_subprocess.py --baseline,
+        # which needs a kernel to run; reuse the initial kernel that
+        # benchmark_kernel() writes to the artifacts dir when it exists.
+        artifacts_dir = self.log_dir / "artifacts"
+        initial_kernel = artifacts_dir / "initial_kernel.py"
+        kernel_file = initial_kernel if initial_kernel.exists() else None
+        result = benchmarker.benchmark_pytorch(problem_file, kernel_file=kernel_file)
         pytorch_time = result.get("time_ms", float("inf"))
 
         if pytorch_time != float("inf"):
@@ -245,8 +252,14 @@ class NvidiaWorkerRunner(WorkerRunner):
             p.start()
             workers.append(p)
 
-        # Wait for completion with timeout
-        worker_timeout = 1800  # 30 minutes
+        # Wait for completion with timeout. One worker round does: LLM diagnosis
+        # + kernel generation (a reasoning model can take 10+ min) + remote
+        # benchmark + remote NCU profiling (slow at large sizes). The old 30-min
+        # cap killed workers mid-generation, yielding "no successful worker" with
+        # no reply/kernel saved. Default to 1h; keep it >= the LLM timeout so the
+        # LLM call is never the thing that outlives its own worker. Override with
+        # KERNEL_WORKER_TIMEOUT_S.
+        worker_timeout = int(os.environ.get("KERNEL_WORKER_TIMEOUT_S", "3600"))
         deadline = time.time() + worker_timeout
         for w in workers:
             remaining = max(0, deadline - time.time())

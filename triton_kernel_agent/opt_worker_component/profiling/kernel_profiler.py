@@ -239,6 +239,8 @@ class KernelProfiler:
                     launch_skip=3,  # Skip warmup iterations, capture final run
                     launch_count=20,
                     timeout=self.ncu_timeout_seconds,
+                    kernel_file=kernel_file,
+                    problem_file=problem_file,
                 )
 
                 # Load and parse metrics
