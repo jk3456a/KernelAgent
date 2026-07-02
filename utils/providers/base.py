@@ -29,6 +29,14 @@ class LLMResponse:
     provider: str
     usage: dict[str, Any] | None = None
     response_id: str | None = None
+    # Why the model stopped: "stop" (normal), "length" (hit max_tokens — output
+    # was truncated), "content_filter", etc. Lets callers distinguish a
+    # truncated/empty response from a genuine model answer.
+    finish_reason: str | None = None
+    # Reasoning-model chain-of-thought (GLM/o-series expose this separately from
+    # the answer). Captured so the trajectory can show what the model thought,
+    # not just what it wrote.
+    reasoning: str | None = None
 
 
 class BaseProvider(ABC):

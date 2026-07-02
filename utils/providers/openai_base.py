@@ -37,6 +37,55 @@ class OpenAICompatibleProvider(BaseProvider):
         self._original_proxy_env = None
         super().__init__()
 
+    def _client_timeout(self) -> float:
+        """Read timeout (seconds) for LLM calls.
+
+        Reasoning models (GLM-5.2 with a 1M token budget) can spend many minutes
+        emitting a long reasoning trace before any content, blowing past the
+        SDK's 600s default and raising APITimeoutError mid-optimization. Default
+        to 1 hour; override with LLM_TIMEOUT_S.
+        """
+        import os
+
+        try:
+            return float(os.environ.get("LLM_TIMEOUT_S", "3600"))
+        except ValueError:
+            return 3600.0
+
+    def _create_with_hard_timeout(self, api_params: dict):
+        """Run the chat-completions call under a wall-clock hard timeout.
+
+        The SDK/httpx read timeout is unreliable when the connection is silently
+        dropped by an intermediary (e.g. a tsh/ssh proxy going half-open): the
+        read blocks forever and the optimization loop hangs. A watchdog thread
+        with ``future.result(timeout=...)`` guarantees the call returns (or
+        raises TimeoutError) so the caller can record a failure and move on.
+        The hard cap is slightly above the client read timeout so a genuinely
+        slow-but-alive response is not killed prematurely.
+        """
+        import concurrent.futures
+
+        hard = self._client_timeout() + 120
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = ex.submit(self.client.chat.completions.create, **api_params)
+        try:
+            result = future.result(timeout=hard)
+            ex.shutdown(wait=False)
+            return result
+        except concurrent.futures.TimeoutError as exc:
+            # Do NOT wait for the stuck worker thread (a blocked socket read can
+            # never be interrupted from Python); abandon it so the loop proceeds.
+            ex.shutdown(wait=False)
+            logging.getLogger(__name__).error(
+                "%s chat completion exceeded hard timeout of %.0fs "
+                "(connection likely stalled); abandoning call.",
+                self.name,
+                hard,
+            )
+            raise TimeoutError(
+                f"LLM call exceeded hard timeout of {hard:.0f}s"
+            ) from exc
+
     def _initialize_client(self) -> None:
         """Initialize OpenAI-compatible client."""
         if not OPENAI_AVAILABLE:
@@ -47,11 +96,13 @@ class OpenAICompatibleProvider(BaseProvider):
             # Configure proxy using centralized utility function
             self._original_proxy_env = configure_proxy_environment()
 
-            # Initialize client (proxy configured via environment variables)
+            # Initialize client (proxy configured via environment variables).
+            # A generous read timeout keeps long reasoning-model calls from
+            # failing as APITimeoutError.
+            kwargs = {"api_key": api_key, "timeout": self._client_timeout()}
             if self.base_url:
-                self.client = OpenAI(api_key=api_key, base_url=self.base_url)
-            else:
-                self.client = OpenAI(api_key=api_key)
+                kwargs["base_url"] = self.base_url
+            self.client = OpenAI(**kwargs)
 
     def get_response(
         self, model_name: str, messages: list[dict[str, str]], **kwargs
@@ -61,19 +112,47 @@ class OpenAICompatibleProvider(BaseProvider):
             raise RuntimeError(f"{self.name} client not available")
 
         api_params = self._build_api_params(model_name, messages, **kwargs)
-        response = self.client.chat.completions.create(**api_params)
+        response = self._create_with_hard_timeout(api_params)
         logging.getLogger(__name__).info(
             "OpenAI chat response (single): %s",
             getattr(response, "model_dump", lambda: str(response))(),
         )
 
+        choice = response.choices[0]
+        content = choice.message.content
+        finish_reason = getattr(choice, "finish_reason", None)
+        # Reasoning models (GLM, o-series) expose their chain-of-thought
+        # separately from the answer; the SDK surfaces it as reasoning_content
+        # (sometimes only under model_extra). Capture it for the trajectory.
+        reasoning = getattr(choice.message, "reasoning_content", None) or (
+            getattr(choice.message, "model_extra", None) or {}
+        ).get("reasoning_content")
+        # Surface the two silent-failure modes that otherwise look like "the
+        # model wrote nothing useful": a length-truncated response (raise
+        # max_tokens) and an empty body (common with reasoning models when the
+        # token budget is spent on reasoning before any content is emitted).
+        if finish_reason == "length":
+            logging.getLogger(__name__).warning(
+                "%s response truncated (finish_reason=length): output hit "
+                "max_tokens; raise max_tokens.",
+                self.name,
+            )
+        elif not content:
+            logging.getLogger(__name__).warning(
+                "%s returned empty content (finish_reason=%s).",
+                self.name,
+                finish_reason,
+            )
+
         return LLMResponse(
-            content=response.choices[0].message.content,
+            content=content,
             model=model_name,
             provider=self.name,
             usage=response.usage.dict()
             if hasattr(response, "usage") and response.usage
             else None,
+            finish_reason=finish_reason,
+            reasoning=reasoning,
         )
 
     def get_multiple_responses(
@@ -98,6 +177,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 usage=response.usage.dict()
                 if hasattr(response, "usage") and response.usage
                 else None,
+                finish_reason=getattr(choice, "finish_reason", None),
             )
             for choice in response.choices
         ]
