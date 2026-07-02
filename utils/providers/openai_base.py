@@ -98,8 +98,20 @@ class OpenAICompatibleProvider(BaseProvider):
 
             # Initialize client (proxy configured via environment variables).
             # A generous read timeout keeps long reasoning-model calls from
-            # failing as APITimeoutError.
-            kwargs = {"api_key": api_key, "timeout": self._client_timeout()}
+            # failing as APITimeoutError; max_retries makes the SDK retry
+            # transient upstream failures (gateway 5xx/504, connection resets)
+            # that are common when a proxied reasoning-model endpoint is busy.
+            import os
+
+            try:
+                retries = int(os.environ.get("LLM_MAX_RETRIES", "4"))
+            except ValueError:
+                retries = 4
+            kwargs = {
+                "api_key": api_key,
+                "timeout": self._client_timeout(),
+                "max_retries": retries,
+            }
             if self.base_url:
                 kwargs["base_url"] = self.base_url
             self.client = OpenAI(**kwargs)

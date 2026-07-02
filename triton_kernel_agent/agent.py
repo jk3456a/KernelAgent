@@ -368,8 +368,11 @@ if __name__ == "__main__":
                 kernels = []
                 messages = [{"role": "user", "content": prompt}]
 
-                # Use provider's multiple response capability
-                max_completion_tokens = 20000
+                # Use provider's multiple response capability. Ask for a large
+                # token budget: reasoning models (GLM-5.2) spend most of the
+                # budget on the reasoning trace, and a tight cap truncates the
+                # kernel to empty. The provider clamps to its real limit.
+                max_completion_tokens = 1_000_000
 
                 if self.provider.supports_multiple_completions():
                     # Provider supports native multiple completions
@@ -425,39 +428,21 @@ if __name__ == "__main__":
                     raise ValueError("No valid kernel code found in any LLM response")
 
             except Exception as e:
+                # Fail fast. A mock fallback here would emit a placeholder kernel
+                # (e.g. `def kernel_function(*args, **kwargs): return True`) that
+                # can pass weak tests and be falsely reported as success, then
+                # crash downstream in agent2 with "Mock kernel not implemented".
+                # An LLM/API failure (e.g. a 504 from the endpoint) must surface,
+                # not be papered over. (Mirrors the no-mock-fallback rule already
+                # applied to test generation above.)
                 self.logger.error(f"Error generating kernels with LLM API: {e}")
-                # Fall back to mock implementation
-
-        # Mock kernel generation (fallback)
-        self.logger.info(f"Generating {num_seeds} kernel seeds (mock implementation)")
-
-        kernels = []
-        for i in range(num_seeds):
-            # Simpler mock that still demonstrates the wrapper pattern
-            if i == 2:  # Third kernel will pass
-                kernel = '''"""
-Kernel implementation - working version.
-"""
-
-def kernel_function(*args, **kwargs):
-    """Wrapper function that handles kernel launch."""
-    # Mock implementation that passes tests
-    # In real kernels, this would launch a Triton kernel
-    return True
-'''
-            else:
-                kernel = f'''"""
-Kernel implementation {i + 1}.
-"""
-
-def kernel_function(*args, **kwargs):
-    """Wrapper function that handles kernel launch."""
-    # Mock implementation that fails
-    raise NotImplementedError('Mock kernel not implemented')
-'''
-            kernels.append(kernel)
-
-        return kernels
+                raise
+        # Unreachable when a provider is configured; kept explicit so a missing
+        # provider is an obvious error rather than a silent mock.
+        raise RuntimeError(
+            "No LLM provider available for kernel generation and mock fallback "
+            "is disabled."
+        )
 
     def generate_kernel(
         self,
