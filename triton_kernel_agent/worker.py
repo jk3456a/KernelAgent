@@ -36,6 +36,14 @@ from .prompt_manager import PromptManager
 from .worker_util import _run_test_multiprocess
 
 
+# The SSOT argument-binding modules the generated test imports
+# (``from timing import bind_kernel_function``). They must sit alongside the
+# test in the workdir — locally and on the remote host — so verification binds
+# kernel arguments identically to benchmarking.
+_BENCH_DIR = Path(__file__).resolve().parent / "opt_worker_component" / "benchmarking"
+_TEST_SUPPORT_MODULES = (_BENCH_DIR / "timing.py", _BENCH_DIR / "kernel_binding.py")
+
+
 DISALLOWED_TORCH_PATTERNS = [
     (
         re.compile(r"\bimport\s+torch\.nn(\b|\s+as\b)"),
@@ -304,6 +312,7 @@ class VerificationWorker:
                 entries are written to ``test_extra_{i}_kernel.py``.
         """
         self.kernel_file.write_text(kernel_code)
+        self._write_test_support_modules()
         self.test_files = []
         for i, code in enumerate(test_code):
             name = "test_kernel.py" if i == 0 else f"test_extra_{i}_kernel.py"
@@ -311,6 +320,16 @@ class VerificationWorker:
             path.write_text(code)
             self.test_files.append(path)
         self.logger.info("Wrote kernel and %d test file(s)", len(self.test_files))
+
+    def _write_test_support_modules(self):
+        """Copy the SSOT binding modules the test imports into the workdir.
+
+        The generated test does ``from timing import bind_kernel_function``; that
+        module (and its ``kernel_binding`` dependency) must be present in the
+        workdir so it is rsynced to the remote host alongside the test.
+        """
+        for src in _TEST_SUPPORT_MODULES:
+            (self.workdir / src.name).write_bytes(src.read_bytes())
 
     def _strip_comments_and_strings(self, code: str) -> str:
         """Remove comments and docstrings to avoid false positives when scanning code."""
@@ -339,7 +358,12 @@ class VerificationWorker:
         if remote_config.is_remote_enabled(remote_cfg):
             test_names = [t.name for t in self.test_files if t.exists()]
             if not test_names:
-                return True, "", ""
+                return (
+                    False,
+                    "",
+                    "No runnable test files: verification cannot report "
+                    "success when nothing was executed.",
+                )
             try:
                 return remote_exec.run_workdir_tests(
                     remote_cfg, self.workdir, test_names, timeout_s=self.test_timeout_s
@@ -353,9 +377,12 @@ class VerificationWorker:
                 )
 
         try:
+            ran_any = False
+            stdout, stderr = "", ""
             for test_file in self.test_files:
                 if not test_file.exists():
                     continue
+                ran_any = True
                 result = subprocess.run(
                     [sys.executable, str(test_file)],
                     cwd=str(self.workdir),
@@ -363,6 +390,7 @@ class VerificationWorker:
                     text=True,
                     timeout=self.test_timeout_s,
                 )
+                stdout, stderr = result.stdout, result.stderr
                 if result.returncode != 0:
                     self.logger.error(
                         "Test %s failed. Exit code: %s, stderr: %s",
@@ -373,7 +401,14 @@ class VerificationWorker:
                     return False, result.stdout, result.stderr
                 self.logger.info("Test %s passed", test_file.name)
 
-            return True, result.stdout, result.stderr
+            if not ran_any:
+                return (
+                    False,
+                    "",
+                    "No runnable test files: verification cannot report "
+                    "success when nothing was executed.",
+                )
+            return True, stdout, stderr
 
         except subprocess.TimeoutExpired:
             self.logger.error("Test timed out")

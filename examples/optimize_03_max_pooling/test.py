@@ -12,115 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness test for 3D max pooling kernel."""
+"""Task-agnostic correctness test for a Triton kernel.
 
-import inspect
+Argument binding is delegated to the shared SSOT binder in ``timing.py``
+(``bind_kernel_function``), the SAME one used by benchmarking, so a kernel that
+verifies here binds identically under benchmarking. Tensor parameters (inputs +
+model weights/biases) are bound positionally — kernel tensor names may be
+chosen freely — while scalar hyperparameters bind by name.
+"""
+
 import sys
 
 import torch
 from kernel import kernel_function
-from problem import get_init_inputs, get_inputs, Model
-
-_CONV_TYPES = (
-    torch.nn.Conv1d,
-    torch.nn.Conv2d,
-    torch.nn.Conv3d,
-    torch.nn.ConvTranspose1d,
-    torch.nn.ConvTranspose2d,
-    torch.nn.ConvTranspose3d,
-)
-_NORM_TYPES = (
-    torch.nn.BatchNorm1d,
-    torch.nn.BatchNorm2d,
-    torch.nn.BatchNorm3d,
-    torch.nn.LayerNorm,
-    torch.nn.GroupNorm,
-    torch.nn.InstanceNorm1d,
-    torch.nn.InstanceNorm2d,
-    torch.nn.InstanceNorm3d,
-)
-_POOL_TYPES = (
-    torch.nn.MaxPool1d,
-    torch.nn.MaxPool2d,
-    torch.nn.MaxPool3d,
-    torch.nn.AvgPool1d,
-    torch.nn.AvgPool2d,
-    torch.nn.AvgPool3d,
-    torch.nn.AdaptiveAvgPool1d,
-    torch.nn.AdaptiveAvgPool2d,
-    torch.nn.AdaptiveAvgPool3d,
-    torch.nn.AdaptiveMaxPool1d,
-    torch.nn.AdaptiveMaxPool2d,
-    torch.nn.AdaptiveMaxPool3d,
-)
-
-
-def _extract_model_params(model):
-    """Extract learnable parameters and layer config from a PyTorch model."""
-    params = {}
-
-    for _, module in model.named_modules():
-        if isinstance(module, (*_CONV_TYPES, torch.nn.Linear)):
-            if hasattr(module, "weight") and module.weight is not None:
-                params.setdefault("weight", module.weight)
-                params.setdefault("w", module.weight)
-                if getattr(module, "bias", None) is not None:
-                    params.setdefault("conv_bias", module.bias)
-                    params.setdefault("bias", module.bias)
-                for attr in ("stride", "padding", "dilation", "output_padding"):
-                    val = getattr(module, attr, None)
-                    if val is not None:
-                        params.setdefault(attr, val)
-                if hasattr(module, "groups"):
-                    params.setdefault("groups", module.groups)
-
-        elif isinstance(module, _NORM_TYPES):
-            if getattr(module, "weight", None) is not None:
-                params.setdefault("weight", module.weight)
-                params.setdefault("w", module.weight)
-            if getattr(module, "bias", None) is not None:
-                params.setdefault("bias", module.bias)
-            if hasattr(module, "eps"):
-                params["eps"] = module.eps
-            if hasattr(module, "num_groups"):
-                params["num_groups"] = module.num_groups
-            if hasattr(module, "normalized_shape"):
-                params["normalized_shape"] = module.normalized_shape
-
-        elif isinstance(module, _POOL_TYPES):
-            for attr in ("kernel_size", "stride", "padding", "dilation"):
-                val = getattr(module, attr, None)
-                if val is not None:
-                    params.setdefault(attr, val)
-
-    if hasattr(model, "bias") and isinstance(
-        model.bias, (torch.Tensor, torch.nn.Parameter)
-    ):
-        params["add_bias"] = model.bias
-        params.setdefault("bias", model.bias)
-
-    # Extract simple scalar attributes stored by Model.__init__
-    # (catches dim, negative_slope, min_val, max_val, etc.)
-    _INIT_SCALAR_NAMES = {
-        "dim",
-        "negative_slope",
-        "min_val",
-        "max_val",
-        "beta",
-        "threshold",
-        "alpha",
-        "lambd",
-        "upper",
-        "lower",
-        "p",
-    }
-    for attr_name in _INIT_SCALAR_NAMES:
-        if hasattr(model, attr_name) and not isinstance(
-            getattr(model, attr_name), (torch.Tensor, torch.nn.Module)
-        ):
-            params.setdefault(attr_name, getattr(model, attr_name))
-
-    return params
+from problem import Model, get_init_inputs, get_inputs
+from timing import bind_kernel_function
 
 
 def test_kernel():
@@ -142,109 +48,10 @@ def test_kernel():
     with torch.no_grad():
         ref_output = model(*inputs)
 
-    # Smart parameter binding: detect if kernel needs model params
-    sig = inspect.signature(kernel_function)
-    kernel_params = list(sig.parameters.keys())
-    param_kinds = [p.kind for p in sig.parameters.values()]
-    has_var_positional = any(k == inspect.Parameter.VAR_POSITIONAL for k in param_kinds)
-    has_var_keyword = any(k == inspect.Parameter.VAR_KEYWORD for k in param_kinds)
-    _MODEL_PARAM_NAMES = {
-        "weight",
-        "w",
-        "kernel_size",
-        "stride",
-        "padding",
-        "dilation",
-        "output_padding",
-        "groups",
-        "bias",
-        "conv_bias",
-        "eps",
-        "num_groups",
-        "normalized_shape",
-        "dim",
-        "negative_slope",
-        "min_val",
-        "max_val",
-        "beta",
-        "threshold",
-        "alpha",
-        "lambd",
-        "upper",
-        "lower",
-        "p",
-    }
-    needs_model = bool(_MODEL_PARAM_NAMES & set(kernel_params))
-    # If kernel uses *args/**kwargs, inspect its source for weight-related hints
-    if not needs_model and (has_var_positional or has_var_keyword):
-        try:
-            src = inspect.getsource(kernel_function)
-            needs_model = any(
-                kw in src
-                for kw in (
-                    "weight",
-                    "is_weight",
-                    "w.shape",
-                    "w.ndim",
-                    "kernel_size",
-                    "dilation",
-                )
-            )
-        except (OSError, TypeError):
-            pass
-
-    if needs_model:
-        model_params = _extract_model_params(model)
-        has_weight = "weight" in model_params or "w" in model_params
-        if has_var_positional and has_weight:
-            # *args kernel with weight: pass (input, weight1, weight2, ...) positionally
-            pos_args = list(inputs)
-            # Collect ALL conv/linear weights from model
-            for _, mod in model.named_modules():
-                if isinstance(mod, (*_CONV_TYPES, torch.nn.Linear)):
-                    if hasattr(mod, "weight") and mod.weight is not None:
-                        pos_args.append(mod.weight)
-            # Pass config params as kwargs
-            config_kwargs = {}
-            for k, v in model_params.items():
-                if k not in ("weight", "w", "bias", "conv_bias", "add_bias"):
-                    # Convert uniform tuples to scalar int for compatibility
-                    if (
-                        isinstance(v, (tuple, list))
-                        and len(v) >= 1
-                        and all(e == v[0] for e in v)
-                    ):
-                        v = v[0]
-                    config_kwargs[k] = v
-            kernel_output = kernel_function(*pos_args, **config_kwargs)
-        else:
-            # Bind keyword args, adapting tuple/int form to match defaults
-            call_args = {}
-            pos_idx = 0
-            for pname in kernel_params:
-                p = sig.parameters[pname]
-                if (
-                    p.kind == inspect.Parameter.VAR_POSITIONAL
-                    or p.kind == inspect.Parameter.VAR_KEYWORD
-                ):
-                    continue
-                if pname in model_params:
-                    val = model_params[pname]
-                    # Convert tuple/list to scalar when kernel expects int
-                    if isinstance(val, (tuple, list)):
-                        if p.default is not inspect.Parameter.empty and isinstance(
-                            p.default, int
-                        ):
-                            val = val[0]
-                        elif len(val) == 1:
-                            val = val[0]
-                    call_args[pname] = val
-                elif pos_idx < len(inputs):
-                    call_args[pname] = inputs[pos_idx]
-                    pos_idx += 1
-            kernel_output = kernel_function(**call_args)
-    else:
-        kernel_output = kernel_function(*inputs)
+    # Bind kernel arguments via the shared planner (positional tensors +
+    # named config scalars) and invoke.
+    invoke = bind_kernel_function(kernel_function, inputs, model)
+    kernel_output = invoke()
 
     # Compare
     # Handle in-place kernels that return None

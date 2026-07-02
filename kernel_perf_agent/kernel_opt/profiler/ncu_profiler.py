@@ -125,6 +125,14 @@ def _profile_triton_kernel_remote(
     (remote_dir / kernel_file.name).write_bytes(kernel_file.read_bytes())
     (remote_dir / problem_file.name).write_bytes(problem_file.read_bytes())
 
+    # The wrapper imports the SSOT binder (``from timing import
+    # bind_kernel_function``); push those modules (written next to the wrapper
+    # by NCUWrapperFactory) into the remote workdir too.
+    for mod_name in ("timing.py", "kernel_binding.py"):
+        mod_path = benchmark_script.parent / mod_name
+        if mod_path.exists():
+            (remote_dir / mod_name).write_bytes(mod_path.read_bytes())
+
     # Build the remote ncu command (runs in the pushed workdir). ncu is on the
     # remote PATH (verified: /usr/local/bin/ncu, root, no sudo needed).
     ncu_cmd = (

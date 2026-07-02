@@ -214,7 +214,8 @@ class Benchmark:
         workdir.mkdir(parents=True, exist_ok=True)
         bench_script = Path(__file__).parent / "kernel_subprocess.py"
         timing_mod = Path(__file__).parent / "timing.py"
-        for src in (bench_script, timing_mod, kernel_file, problem_file):
+        binding_mod = Path(__file__).parent / "kernel_binding.py"
+        for src in (bench_script, timing_mod, binding_mod, kernel_file, problem_file):
             (workdir / src.name).write_bytes(src.read_bytes())
 
         results_name = "benchmark_results.json"
@@ -340,7 +341,8 @@ class Benchmark:
             workdir.mkdir(parents=True, exist_ok=True)
             bench_script = Path(__file__).parent / "kernel_subprocess.py"
             timing_mod = Path(__file__).parent / "timing.py"
-            for src in (bench_script, timing_mod, kernel_file, problem_file):
+            binding_mod = Path(__file__).parent / "kernel_binding.py"
+            for src in (bench_script, timing_mod, binding_mod, kernel_file, problem_file):
                 (workdir / src.name).write_bytes(src.read_bytes())
 
             results_name = "pytorch_baseline.json"

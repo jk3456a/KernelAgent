@@ -27,144 +27,42 @@ Design:
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import sys
 from pathlib import Path
 
 from timing import (
+    bind_kernel_function,
     import_module,
     load_kernel_function,
     load_problem_interface,
     prepare_inputs,
 )
-from typing import Any, Callable, Tuple
+from typing import Any, Callable
 
 import torch
 import triton.testing as tt
 
 
-_CONV_TYPES = (
-    torch.nn.Conv1d,
-    torch.nn.Conv2d,
-    torch.nn.Conv3d,
-    torch.nn.ConvTranspose1d,
-    torch.nn.ConvTranspose2d,
-    torch.nn.ConvTranspose3d,
-)
-_NORM_TYPES = (
-    torch.nn.BatchNorm1d,
-    torch.nn.BatchNorm2d,
-    torch.nn.BatchNorm3d,
-    torch.nn.LayerNorm,
-    torch.nn.GroupNorm,
-    torch.nn.InstanceNorm1d,
-    torch.nn.InstanceNorm2d,
-    torch.nn.InstanceNorm3d,
-)
-_POOL_TYPES = (
-    torch.nn.MaxPool1d,
-    torch.nn.MaxPool2d,
-    torch.nn.MaxPool3d,
-    torch.nn.AvgPool1d,
-    torch.nn.AvgPool2d,
-    torch.nn.AvgPool3d,
-    torch.nn.AdaptiveAvgPool1d,
-    torch.nn.AdaptiveAvgPool2d,
-    torch.nn.AdaptiveAvgPool3d,
-    torch.nn.AdaptiveMaxPool1d,
-    torch.nn.AdaptiveMaxPool2d,
-    torch.nn.AdaptiveMaxPool3d,
-)
-
-
-def _extract_model_params(model: torch.nn.Module) -> tuple[dict[str, Any], list]:
-    """Extract all learnable parameters and layer config from a PyTorch model.
-
-    Walks model submodules and extracts weights, biases, and layer-specific
-    hyperparameters (stride, padding, etc.) into a flat dict keyed by
-    parameter name.  The keys are chosen to match common kernel function
-    signatures (``weight``, ``bias``, ``conv_bias``, ``stride``, …).
-
-    Returns:
-        Tuple of (flat dict mapping parameter names to values,
-                  ordered list of all conv/linear weight tensors).
-    """
-    params: dict[str, Any] = {}
-    all_weights: list = []
-
-    for _, module in model.named_modules():
-        if isinstance(module, (*_CONV_TYPES, torch.nn.Linear)):
-            if hasattr(module, "weight") and module.weight is not None:
-                all_weights.append(module.weight)
-                params.setdefault("weight", module.weight)
-                params.setdefault("w", module.weight)  # alias
-                if getattr(module, "bias", None) is not None:
-                    params.setdefault("conv_bias", module.bias)
-                    params.setdefault("bias", module.bias)
-
-                # Conv / ConvTranspose hyperparameters
-                for attr in ("stride", "padding", "dilation", "output_padding"):
-                    val = getattr(module, attr, None)
-                    if val is not None:
-                        params.setdefault(attr, val)
-                if hasattr(module, "groups"):
-                    params.setdefault("groups", module.groups)
-
-                # NO break — collect all conv/linear weights
-
-        elif isinstance(module, _NORM_TYPES):
-            if getattr(module, "weight", None) is not None:
-                params.setdefault("weight", module.weight)
-                params.setdefault("w", module.weight)
-            if getattr(module, "bias", None) is not None:
-                params.setdefault("bias", module.bias)
-            if hasattr(module, "eps"):
-                params["eps"] = module.eps
-            if hasattr(module, "num_groups"):
-                params["num_groups"] = module.num_groups
-            if hasattr(module, "normalized_shape"):
-                params["normalized_shape"] = module.normalized_shape
-
-        elif isinstance(module, _POOL_TYPES):
-            for attr in ("kernel_size", "stride", "padding", "dilation"):
-                val = getattr(module, attr, None)
-                if val is not None:
-                    params.setdefault(attr, val)
-
-    # Top-level bias on the model itself (for fusion kernels like Conv+ReLU+BiasAdd)
-    if hasattr(model, "bias") and isinstance(
-        model.bias, (torch.Tensor, torch.nn.Parameter)
-    ):
-        params["add_bias"] = model.bias
-        params.setdefault("bias", model.bias)
-
-    return params, all_weights
-
-
-def _run_once(
-    fn: Callable, inputs: Tuple[torch.Tensor, ...], init_inputs: list, name: str
-) -> torch.Tensor:
-    """Run kernel once to verify execution and get output shape/dtype."""
+def _run_once(invoke: Callable[[], torch.Tensor], name: str) -> torch.Tensor:
+    """Run the bound kernel once to verify execution and get output shape."""
     try:
         with torch.inference_mode():
-            return fn(*inputs, *init_inputs)
+            return invoke()
     except Exception as exc:
         raise RuntimeError(f"{name} failed to execute: {exc}") from exc
 
 
 def _benchmark(
-    fn: Callable,
-    inputs: Tuple[torch.Tensor, ...],
-    init_inputs: list,
+    invoke: Callable[[], torch.Tensor],
     name: str,
     warmup: int = 25,
     rep: int = 100,
 ) -> float:
-    """Benchmark a kernel function using triton.testing.do_bench."""
+    """Benchmark a bound kernel callable using triton.testing.do_bench."""
     try:
         ms = tt.do_bench(
-            lambda: fn(*inputs, *init_inputs),
+            invoke,
             warmup=warmup,
             rep=rep,
             return_mode="mean",
@@ -276,136 +174,32 @@ def _prepare_kernel(
     Model: type,
     baseline_model: torch.nn.Module | None,
     init_inputs: list,
+    inputs: list,
     device: torch.device,
     dtype: torch.dtype,
     quiet: bool = False,
-) -> tuple[Callable, list]:
-    """Load kernel and wrap it with model parameters if needed.
+) -> Callable[[], torch.Tensor]:
+    """Load the kernel and bind its arguments via the shared SSOT planner.
+
+    Verification (``test.py``) and benchmarking use the *same*
+    :func:`bind_kernel_function`, so a kernel that verifies binds identically
+    here — tensor parameters are matched positionally (names are irrelevant),
+    scalar hyperparameters by name.
 
     Returns:
-        Tuple of (kernel_function, kernel_init_args) where kernel_init_args
-        is always [] (model params are baked into the wrapper).
+        A zero-argument callable that invokes the kernel with bound arguments.
     """
     kernel_function = load_kernel_function(kernel_file)
 
-    # Check if kernel expects model-derived parameters:
-    # - 'weight' / 'w' for Conv, Linear, Norm layers
-    # - pooling scalars (kernel_size, stride, padding, dilation) for Pool layers
-    _MODEL_PARAM_NAMES = {"weight", "w", "kernel_size", "stride", "padding", "dilation"}
-    needs_model = False
-    has_var_positional = False
-    has_var_keyword = False
-    kernel_params: list[str] = []
-    try:
-        sig = inspect.signature(kernel_function)
-        kernel_params = [
-            name
-            for name, p in sig.parameters.items()
-            if p.kind
-            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-        ]
-        param_kinds = [p.kind for p in sig.parameters.values()]
-        has_var_positional = any(
-            k == inspect.Parameter.VAR_POSITIONAL for k in param_kinds
+    extract_model = baseline_model
+    if extract_model is None and Model is not None:
+        extract_model = (
+            Model(*init_inputs).to(device=device, dtype=dtype)
+            if init_inputs
+            else Model().to(device=device, dtype=dtype)
         )
-        has_var_keyword = any(k == inspect.Parameter.VAR_KEYWORD for k in param_kinds)
-        if _MODEL_PARAM_NAMES.intersection(kernel_params):
-            needs_model = True
-        # If kernel uses *args/**kwargs, inspect source for weight-related patterns
-        if not needs_model and (has_var_positional or has_var_keyword):
-            try:
-                src = inspect.getsource(kernel_function)
-                needs_model = any(
-                    kw in src
-                    for kw in (
-                        "weight",
-                        "is_weight",
-                        "w.shape",
-                        "w.ndim",
-                        "kernel_size",
-                        "dilation",
-                    )
-                )
-            except (OSError, TypeError):
-                pass
-    except Exception:
-        pass
 
-    kernel_init_args: list = []
-
-    if needs_model and Model is not None:
-        try:
-            extract_model = baseline_model
-            if extract_model is None:
-                extract_model = (
-                    Model(*init_inputs).to(device=device, dtype=dtype)
-                    if init_inputs
-                    else Model().to(device=device, dtype=dtype)
-                )
-
-            model_params, all_weights = _extract_model_params(extract_model)
-
-            if model_params:
-                original_fn = kernel_function
-
-                if has_var_positional and all_weights:
-                    # *args kernel: pass (inputs + weights) positionally,
-                    # config as kwargs with uniform tuples collapsed to scalars
-                    def kernel_with_model_varargs(*args, **kwargs):
-                        pos_args = list(args) + list(all_weights)
-                        config_kwargs = {}
-                        for k, v in model_params.items():
-                            if k not in (
-                                "weight",
-                                "w",
-                                "bias",
-                                "conv_bias",
-                                "add_bias",
-                            ):
-                                if (
-                                    isinstance(v, (tuple, list))
-                                    and len(v) >= 1
-                                    and all(e == v[0] for e in v)
-                                ):
-                                    v = v[0]
-                                config_kwargs[k] = v
-                        return original_fn(*pos_args, **config_kwargs)
-
-                    kernel_function = kernel_with_model_varargs
-                else:
-                    # Build a wrapper that maps extracted params into the kernel
-                    # signature by name.  Positional args (from *inputs) fill the
-                    # leading parameters that are NOT found in model_params.
-                    def kernel_with_model(*args, **kwargs):
-                        bound: dict[str, Any] = {}
-                        positional_idx = 0
-                        for pname in kernel_params:
-                            if pname in model_params:
-                                v = model_params[pname]
-                                if (
-                                    isinstance(v, (tuple, list))
-                                    and len(v) >= 1
-                                    and all(e == v[0] for e in v)
-                                ):
-                                    v = v[0]
-                                bound[pname] = v
-                            elif positional_idx < len(args):
-                                bound[pname] = args[positional_idx]
-                                positional_idx += 1
-                        return original_fn(**bound)
-
-                    kernel_function = kernel_with_model
-        except Exception as exc:
-            if not quiet:
-                print(f"⚠️  Warning: Failed to extract model parameters: {exc}")
-                print("   Falling back to direct kernel invocation")
-
-    # For kernels that don't need model extraction but have init_inputs
-    # (e.g., dim parameter for reduction ops), pass them as positional args
-    if not needs_model and init_inputs:
-        kernel_init_args = init_inputs
-
-    return kernel_function, kernel_init_args
+    return bind_kernel_function(kernel_function, inputs, extract_model)
 
 
 def _save_results(results: dict[str, Any], path: Path) -> None:
@@ -471,7 +265,7 @@ def main():
         if not args.quiet:
             print("1. PyTorch Reference")
         baseline_time = _benchmark(
-            baseline_model, inputs, [], "PyTorch", args.warmup, args.repeat
+            lambda: baseline_model(*inputs), "PyTorch", args.warmup, args.repeat
         )
         results["kernels"]["pytorch_reference"] = {
             "time_ms": baseline_time,
@@ -487,8 +281,15 @@ def main():
         print(f"{idx}. Candidate: {kernel_name}")
 
     try:
-        kernel_fn, kernel_init_args = _prepare_kernel(
-            args.kernel, Model, baseline_model, init_inputs, device, dtype, args.quiet
+        kernel_invoke = _prepare_kernel(
+            args.kernel,
+            Model,
+            baseline_model,
+            init_inputs,
+            inputs,
+            device,
+            dtype,
+            args.quiet,
         )
     except Exception as exc:
         print(f"❌ Failed to load kernel: {exc}")
@@ -499,7 +300,7 @@ def main():
 
     # Verify kernel executes
     try:
-        out = _run_once(kernel_fn, inputs, kernel_init_args, kernel_name)
+        out = _run_once(kernel_invoke, kernel_name)
         if not args.quiet:
             print(f"✓ {kernel_name} executes successfully")
             print(f"  Output shape: {out.shape}, dtype: {out.dtype}")
@@ -512,7 +313,7 @@ def main():
 
     # Benchmark kernel
     kernel_time = _benchmark(
-        kernel_fn, inputs, kernel_init_args, kernel_name, args.warmup, args.repeat
+        kernel_invoke, kernel_name, args.warmup, args.repeat
     )
     results["kernels"][kernel_name] = {"time_ms": kernel_time, "path": str(args.kernel)}
 

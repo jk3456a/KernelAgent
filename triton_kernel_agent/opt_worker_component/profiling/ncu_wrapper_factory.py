@@ -102,5 +102,15 @@ class NCUWrapperFactory:
 
         # Write wrapper file
         wrapper_file.write_text(wrapper_content)
+
+        # Copy the SSOT binding modules the wrapper imports (``from timing
+        # import bind_kernel_function``) alongside it, so it runs both locally
+        # and after being pushed to the remote NCU workdir.
+        bench_dir = (
+            Path(__file__).resolve().parent.parent / "benchmarking"
+        )
+        for mod_name in ("timing.py", "kernel_binding.py"):
+            (output_dir / mod_name).write_bytes((bench_dir / mod_name).read_bytes())
+
         self.logger.info(f"Created NCU wrapper: {wrapper_file}")
         return wrapper_file

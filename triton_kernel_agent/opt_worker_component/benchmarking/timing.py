@@ -24,12 +24,15 @@ Inspired by KernelBench's timing.py
 
 import hashlib
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 import torch
+
+from kernel_binding import CONFIG_PARAM_NAMES, plan_kernel_binding
 
 
 # =============================================================================
@@ -457,3 +460,158 @@ def compute_timing_stats(
         stats["device"] = str(device)
 
     return stats
+
+
+# =============================================================================
+# Kernel argument binding (single source of truth)
+# =============================================================================
+
+
+_CONV_LINEAR_TYPES = (
+    torch.nn.Conv1d,
+    torch.nn.Conv2d,
+    torch.nn.Conv3d,
+    torch.nn.ConvTranspose1d,
+    torch.nn.ConvTranspose2d,
+    torch.nn.ConvTranspose3d,
+    torch.nn.Linear,
+)
+_NORM_TYPES = (
+    torch.nn.BatchNorm1d,
+    torch.nn.BatchNorm2d,
+    torch.nn.BatchNorm3d,
+    torch.nn.LayerNorm,
+    torch.nn.GroupNorm,
+    torch.nn.InstanceNorm1d,
+    torch.nn.InstanceNorm2d,
+    torch.nn.InstanceNorm3d,
+)
+
+
+def extract_model_tensors_and_config(
+    model: torch.nn.Module,
+) -> tuple[list[torch.Tensor], dict[str, Any]]:
+    """Extract model weight/bias tensors (ordered) and config scalars.
+
+    The tensor list is ordered by module traversal (== forward order for the
+    fused single-path models used here): each conv/linear contributes its
+    ``weight`` then ``bias``; each norm its ``weight`` then ``bias``; finally a
+    top-level ``model.bias`` parameter (fusion bias). This ordered queue is what
+    the binding planner maps onto the kernel's positional tensor slots — so the
+    kernel's tensor parameters may be named freely.
+
+    Returns:
+        Tuple of (ordered tensor list, config scalar dict keyed by hyperparameter
+        name such as ``stride`` / ``eps`` / ``kernel_size``).
+    """
+    tensors: list[torch.Tensor] = []
+    config: dict[str, Any] = {}
+
+    for _, module in model.named_modules():
+        if isinstance(module, _CONV_LINEAR_TYPES):
+            if getattr(module, "weight", None) is not None:
+                tensors.append(module.weight)
+            if getattr(module, "bias", None) is not None:
+                tensors.append(module.bias)
+            for attr in ("stride", "padding", "dilation", "output_padding"):
+                val = getattr(module, attr, None)
+                if val is not None:
+                    config.setdefault(attr, val)
+            if hasattr(module, "groups"):
+                config.setdefault("groups", module.groups)
+        elif isinstance(module, _NORM_TYPES):
+            if getattr(module, "weight", None) is not None:
+                tensors.append(module.weight)
+            if getattr(module, "bias", None) is not None:
+                tensors.append(module.bias)
+            if hasattr(module, "eps"):
+                config.setdefault("eps", module.eps)
+            if hasattr(module, "num_groups"):
+                config.setdefault("num_groups", module.num_groups)
+            if hasattr(module, "normalized_shape"):
+                config.setdefault("normalized_shape", module.normalized_shape)
+
+    # Top-level fusion bias (e.g. Conv+ReLU+BiasAdd stores it on the Model).
+    top_bias = getattr(model, "bias", None)
+    if isinstance(top_bias, (torch.Tensor, torch.nn.Parameter)):
+        tensors.append(top_bias)
+
+    # Simple scalar attributes stored directly on the Model (dim, eps, ...).
+    for attr_name in CONFIG_PARAM_NAMES:
+        if hasattr(model, attr_name):
+            val = getattr(model, attr_name)
+            if not isinstance(val, (torch.Tensor, torch.nn.Module)):
+                config.setdefault(attr_name, val)
+
+    return tensors, config
+
+
+def _collapse_uniform(value: Any) -> Any:
+    """Collapse a uniform tuple/list (e.g. ``(3, 3)``) to its scalar element.
+
+    Conv layers expose stride/kernel_size as tuples, but kernels commonly take
+    a scalar int; when all entries are equal, pass the scalar.
+    """
+    if isinstance(value, (tuple, list)) and len(value) >= 1 and all(
+        e == value[0] for e in value
+    ):
+        return value[0]
+    return value
+
+
+def bind_kernel_function(
+    kernel_function: Callable,
+    inputs: list,
+    model: Optional[torch.nn.Module],
+) -> Callable:
+    """Return a zero-arg-adapted callable that invokes ``kernel_function``.
+
+    Uses the shared :func:`plan_kernel_binding` planner so verification and
+    benchmarking bind identically. Tensor parameters (inputs + model weights)
+    are bound positionally — kernel tensor names are never matched — while
+    scalar hyperparameters are bound by name.
+
+    Args:
+        kernel_function: The candidate kernel.
+        inputs: Tensors from ``get_inputs()`` (already on device/dtype).
+        model: The reference model to extract weights/config from, or ``None``
+            for purely functional kernels.
+
+    Returns:
+        A callable taking no arguments that runs the kernel with bound args.
+    """
+    sig = inspect.signature(kernel_function)
+    kernel_params = [
+        name
+        for name, p in sig.parameters.items()
+        if p.kind
+        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    has_var_positional = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+    )
+
+    model_tensors: list = []
+    config: dict[str, Any] = {}
+    if model is not None:
+        model_tensors, config = extract_model_tensors_and_config(model)
+
+    plan = plan_kernel_binding(
+        kernel_params=kernel_params,
+        has_var_positional=has_var_positional,
+        num_inputs=len(inputs),
+        num_model_tensors=len(model_tensors),
+        config_names=list(config.keys()),
+    )
+
+    if not plan.needs_model:
+        return lambda: kernel_function(*inputs)
+
+    def _invoke():
+        args = []
+        for kind, idx in plan.positional_sources:
+            args.append(inputs[idx] if kind == "input" else model_tensors[idx])
+        kwargs = {name: _collapse_uniform(config[name]) for name in plan.config_kwargs}
+        return kernel_function(*args, **kwargs)
+
+    return _invoke
