@@ -28,6 +28,87 @@ except ImportError:
     OpenAI = None
 
 
+class _AggMessage:
+    """A message reassembled from streamed deltas."""
+
+    def __init__(self, content: str, reasoning_content: str | None):
+        self.content = content
+        self.reasoning_content = reasoning_content
+        # Some callers look for reasoning under model_extra; expose it there too.
+        self.model_extra = (
+            {"reasoning_content": reasoning_content} if reasoning_content else None
+        )
+
+
+class _AggChoice:
+    def __init__(self, index, message, finish_reason):
+        self.index = index
+        self.message = message
+        self.finish_reason = finish_reason
+
+
+class _AggResponse:
+    """A non-streaming-shaped response reassembled from stream chunks.
+
+    Exposes the same surface the provider's parsing code reads on a normal
+    completion: ``choices[].message.content`` / ``.reasoning_content`` /
+    ``.finish_reason`` and ``.usage``.
+    """
+
+    def __init__(self, choices, usage):
+        self.choices = choices
+        self.usage = usage
+
+    def model_dump(self):
+        return {
+            "choices": [
+                {"index": c.index, "finish_reason": c.finish_reason}
+                for c in self.choices
+            ]
+        }
+
+
+def _aggregate_stream(chunks) -> "_AggResponse":
+    """Reassemble streamed chat-completion chunks into a response object.
+
+    Streaming is mandatory for the llm-center GLM endpoint: identical requests
+    return in seconds streamed vs. ~90 min non-streamed. Deltas are grouped by
+    ``choice.index`` (to support n>1 seed generation) and content vs.
+    reasoning_content are accumulated separately. The final usage chunk (from
+    ``stream_options={"include_usage": True}``) carries token counts.
+    """
+    content: dict[int, list[str]] = {}
+    reasoning: dict[int, list[str]] = {}
+    finish: dict[int, Any] = {}
+    order: list[int] = []
+    usage = None
+
+    for chunk in chunks:
+        if getattr(chunk, "usage", None) is not None:
+            usage = chunk.usage
+        for choice in getattr(chunk, "choices", None) or []:
+            idx = getattr(choice, "index", 0)
+            if idx not in content:
+                content[idx] = []
+                reasoning[idx] = []
+                order.append(idx)
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                if getattr(delta, "content", None):
+                    content[idx].append(delta.content)
+                if getattr(delta, "reasoning_content", None):
+                    reasoning[idx].append(delta.reasoning_content)
+            if getattr(choice, "finish_reason", None) is not None:
+                finish[idx] = choice.finish_reason
+
+    choices = []
+    for idx in order:
+        r = "".join(reasoning[idx]) or None
+        message = _AggMessage("".join(content[idx]), r)
+        choices.append(_AggChoice(idx, message, finish.get(idx)))
+    return _AggResponse(choices, usage)
+
+
 class OpenAICompatibleProvider(BaseProvider):
     """Base provider for OpenAI-compatible APIs."""
 
@@ -66,8 +147,20 @@ class OpenAICompatibleProvider(BaseProvider):
         import concurrent.futures
 
         hard = self._client_timeout() + 120
+
+        def _stream_and_aggregate():
+            # Stream is mandatory here: the llm-center GLM endpoint serves
+            # non-streaming requests through a pathological slow path (a 6.4k
+            # token completion took ~90 min non-streamed vs ~53 s streamed).
+            # include_usage yields a final chunk carrying token counts.
+            params = dict(api_params)
+            params["stream"] = True
+            params["stream_options"] = {"include_usage": True}
+            stream = self.client.chat.completions.create(**params)
+            return _aggregate_stream(stream)
+
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = ex.submit(self.client.chat.completions.create, **api_params)
+        future = ex.submit(_stream_and_aggregate)
         try:
             result = future.result(timeout=hard)
             ex.shutdown(wait=False)
@@ -175,7 +268,10 @@ class OpenAICompatibleProvider(BaseProvider):
             raise RuntimeError(f"{self.name} client not available")
 
         api_params = self._build_api_params(model_name, messages, n=n, **kwargs)
-        response = self.client.chat.completions.create(**api_params)
+        # Route through the same wall-clock watchdog as the single-response path:
+        # the seed phase (agent1, n>1) must not hang forever on a half-open proxy
+        # connection. A bare create() here blocks the whole pipeline.
+        response = self._create_with_hard_timeout(api_params)
         logging.getLogger(__name__).info(
             "OpenAI chat response (multi): %s",
             getattr(response, "model_dump", lambda: str(response))(),
