@@ -1,5 +1,15 @@
 # KernelAgent — Multi‑Agent GPU Kernel Synthesis and Optimization
 
+> **📌 接手本项目请先读 [`HANDOFF.md`](./HANDOFF.md)（移交上手指南，中文）。**
+>
+> 本仓库是 KernelAgent 的一个 fork，在上游基础上做了大量改造，使其能在**没有本地
+> GPU / PyTorch** 的开发机上运行：代码由 LLM（GLM-5.2）生成，所有需要 GPU 的
+> **验证 / benchmark / NCU profiling 通过 SSH 提交到远程 H100 devspace** 执行，产物回传。
+> 还新增了优化轨迹收集、网页观测面板、续跑（resume）与远程心跳保活。
+> 从零跑通一个 conv 融合算子的生成 + 优化，请照 `HANDOFF.md` 操作（约 30 分钟）。
+>
+> 下文为上游原始 README，介绍整体架构与本地 GPU 场景的用法。
+
 KernelAgent turns PyTorch programs into verified Triton kernels and optimize its performance. It was designed around KernelBench workloads and combines:
 
 - Static problem analysis to decide whether to run a lightweight path or a full pipeline
