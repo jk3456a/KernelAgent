@@ -26,7 +26,11 @@ PROBLEM = (
 def run_agent1() -> bool:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n===== agent1 attempt {attempt}/{MAX_ATTEMPTS} =====", flush=True)
-        agent = TritonKernelAgent(num_workers=4, max_rounds=10, model_name="glm-5.2")
+        # 2 seeds, not 4: GLM-5.2 emits one long reasoning trace per requested
+        # completion for a complex fused-conv kernel, and n=4 in a single request
+        # took ~67 min (past the LLM hard-timeout wall). Two seeds keep the seed
+        # phase under the timeout while still giving the verifier a choice.
+        agent = TritonKernelAgent(num_workers=2, max_rounds=10, model_name="glm-5.2")
         result = agent.generate_kernel(problem_description=PROBLEM)
         print(f"[attempt {attempt}] success={result.get('success')}", flush=True)
         if result.get("success") and result.get("kernel_code"):

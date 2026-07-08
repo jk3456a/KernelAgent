@@ -30,10 +30,15 @@ import os
 import sys
 from pathlib import Path
 
+# Ensure the repo root is importable BEFORE importing the package: when this
+# script is launched via subprocess (by the pipeline runners), Python sets
+# sys.path[0] to examples/, not the repo root, so the import below would fail
+# with ModuleNotFoundError. Prepend the repo root regardless of cwd/PYTHONPATH.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from dotenv import load_dotenv
 from triton_kernel_agent.opt_manager import OptimizationManager
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 
 # Hardcoded config directory relative to this script.
