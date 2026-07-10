@@ -320,7 +320,39 @@ _INDEX_HTML = """<!doctype html>
 </div>
 <script>
 let SEL = null;
+let RENDERED = null;
+let REQUEST_ID = 0;
+const RUN_PAYLOADS = new Map();
+const RUN_VIEWS = new Map();
 const fmt = (x, d=3) => (x==null ? "—" : Number(x).toFixed(d));
+
+function captureView(runId) {
+  if (!runId) return;
+  const main = document.getElementById("main");
+  const details = new Map();
+  main.querySelectorAll("details[data-detail-key]").forEach(d => {
+    const pre = d.querySelector("pre");
+    details.set(d.dataset.detailKey, {
+      open: d.open,
+      scrollTop: pre ? pre.scrollTop : 0,
+    });
+  });
+  RUN_VIEWS.set(runId, {scrollTop: main.scrollTop, details});
+}
+
+function restoreView(runId) {
+  const view = RUN_VIEWS.get(runId);
+  if (!view) return;
+  const main = document.getElementById("main");
+  main.querySelectorAll("details[data-detail-key]").forEach(d => {
+    const state = view.details.get(d.dataset.detailKey);
+    if (!state) return;
+    d.open = state.open;
+    const pre = d.querySelector("pre");
+    if (pre) pre.scrollTop = state.scrollTop;
+  });
+  main.scrollTop = view.scrollTop;
+}
 
 async function loadRuns() {
   const r = await fetch("/api/runs"); const runs = await r.json();
@@ -344,13 +376,20 @@ async function loadRuns() {
 }
 
 async function selectRun(id) {
+  const requestId = ++REQUEST_ID;
   SEL = id; document.querySelectorAll(".run").forEach(d=>d.classList.toggle("sel",
     d.querySelector("b")?.textContent===id));
   const r = await fetch("/api/runs/" + encodeURIComponent(id));
-  const data = await r.json(); render(data);
+  const payload = await r.text();
+  if (requestId !== REQUEST_ID || SEL !== id) return;
+  if (RENDERED === id && RUN_PAYLOADS.get(id) === payload) return;
+  const data = JSON.parse(payload);
+  render(data, id);
+  RUN_PAYLOADS.set(id, payload);
 }
 
-function render(data) {
+function render(data, runId) {
+  captureView(RENDERED);
   const rows = data.rows || [];
   const base = rows.find(x=>x.kind==="baseline");
   const rounds = rows.filter(x=>x.kind==="round");
@@ -370,13 +409,16 @@ function render(data) {
       <th>Δ%</th><th>tensor SOL%</th><th>bottleneck</th><th>config Δ</th><th>status</th><th>attempts</th>
     </tr></thead><tbody>${rounds.map(rowHtml).join("")}</tbody></table>`;
   drawChart(baseMs, rounds);
+  RENDERED = runId;
+  restoreView(runId);
 }
 
 function rowHtml(r) {
   const cfg = Object.entries(r.config_changes||{}).map(([k,v])=>
     `<span class="chg">${k}:${v}</span>`).join(" ") || "—";
   const cls = !r.verified ? "fail" : (r.is_best ? "best" : "");
-  const det = (label,txt) => txt ? `<details><summary>${label}</summary><pre>${esc(txt)}</pre></details>` : "";
+  const det = (key,label,txt) => txt ?
+    `<details data-detail-key="${r.round}:${key}"><summary>${label}</summary><pre>${esc(txt)}</pre></details>` : "";
   // Diagnosis / prescription: pull the summary + recommended fixes out of the
   // strategy json so you can review what the agent decided and why.
   let diag = "";
@@ -386,7 +428,7 @@ function rowHtml(r) {
       return `<b>[${b.category}]</b> ${esc(b.summary||"")}` +
         (fixes.length ? `<br/><span class="chg">fix:</span> ${esc(fixes.join(" | "))}` : "");
     }).join("<hr style='border-color:#30363d'/>");
-    diag = `<details><summary>diagnosis / prescription</summary><div style="padding:6px">${diag}</div></details>`;
+    diag = `<details data-detail-key="${r.round}:diagnosis"><summary>diagnosis / prescription</summary><div style="padding:6px">${diag}</div></details>`;
   }
   const tma = r.used_tma ? `<span class="pill up">TMA</span>` : "";
   // Real NCU numbers for this round (hardware truth, not the coarse summary).
@@ -422,9 +464,9 @@ function rowHtml(r) {
   }
   const bestSoFar = rr && rr.best_so_far_ms != null ? fmt(rr.best_so_far_ms) : fmt(r.time_ms);
   const attempts = ncu + failDetail + diag +
-    det("💭 thinking", r.reasoning) +
-    det("kernel", r.kernel_code) + det("prompt", r.opt_prompt) +
-    det("LLM reply", r.opt_reply) + det("reflexion", r.reflexion);
+    det("thinking", "💭 thinking", r.reasoning) +
+    det("kernel", "kernel", r.kernel_code) + det("prompt", "prompt", r.opt_prompt) +
+    det("llm-reply", "LLM reply", r.opt_reply) + det("reflexion", "reflexion", r.reflexion);
   return `<tr class="${cls}"><td>${r.round}</td><td>${thisRound}</td><td>${bestSoFar}</td>
     <td>${fmt(r.speedup_vs_baseline,2)}×</td><td>${fmt(r.improvement_pct,1)}</td>
     <td>${fmt(r.ncu?r.ncu.tensor_sol:r.combined_sol_pct,1)}</td><td>${r.bottleneck||"—"} ${tma}</td>
