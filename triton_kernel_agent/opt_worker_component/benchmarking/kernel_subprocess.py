@@ -31,6 +31,7 @@ import json
 import sys
 from pathlib import Path
 
+from backend_probe import inspect_pytorch_backend
 from timing import (
     bind_kernel_function,
     import_module,
@@ -264,12 +265,14 @@ def main():
     if baseline_model is not None:
         if not args.quiet:
             print("1. PyTorch Reference")
+        backend = inspect_pytorch_backend(baseline_model, inputs)
         baseline_time = _benchmark(
             lambda: baseline_model(*inputs), "PyTorch", args.warmup, args.repeat
         )
         results["kernels"]["pytorch_reference"] = {
             "time_ms": baseline_time,
             "speedup": 1.0,
+            "backend": backend,
         }
         if not args.quiet:
             print()

@@ -21,6 +21,7 @@ provided, these are used as the default.
 
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -157,13 +158,43 @@ class NvidiaBenchmarker(KernelBenchmarker):
         # which needs a kernel to run; reuse the initial kernel that
         # benchmark_kernel() writes to the artifacts dir when it exists.
         artifacts_dir = self.log_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
         initial_kernel = artifacts_dir / "initial_kernel.py"
         kernel_file = initial_kernel if initial_kernel.exists() else None
         result = benchmarker.benchmark_pytorch(problem_file, kernel_file=kernel_file)
         pytorch_time = result.get("time_ms", float("inf"))
+        backend = result.get("backend")
 
         if pytorch_time != float("inf"):
             self.logger.info(f"PyTorch baseline: {pytorch_time:.4f}ms")
+        if isinstance(backend, dict):
+            backend_path = artifacts_dir / "pytorch_backend.json"
+            try:
+                backend_path.write_text(
+                    json.dumps(
+                        {"problem": str(problem_file), **backend},
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                self.logger.warning(
+                    f"Failed to save PyTorch backend evidence: {exc}"
+                )
+
+            libraries = backend.get("libraries", {})
+            summaries = []
+            for key, label in (("cublas", "cuBLAS"), ("cudnn", "cuDNN")):
+                info = libraries.get(key, {})
+                summaries.append(
+                    f"{label}={info.get('status', 'unknown')}"
+                    f"[{info.get('confidence', 'none')}]"
+                )
+            self.logger.info(
+                "PyTorch baseline backend: " + ", ".join(summaries)
+            )
+            for warning in backend.get("warnings", []):
+                self.logger.warning(f"PyTorch backend inspection: {warning}")
 
         return pytorch_time
 
@@ -488,6 +519,10 @@ class NvidiaRooflineAnalyzer(RooflineAnalyzerBase):
                 kwargs["config"] = self._roofline_config
             self._delegate = RooflineAnalyzer(**kwargs)
         return self._delegate
+
+    @property
+    def config(self) -> Any:
+        return self._get_delegate().config
 
     def analyze(self, ncu_metrics: dict[str, Any]) -> Any:
         return self._get_delegate().analyze(ncu_metrics)

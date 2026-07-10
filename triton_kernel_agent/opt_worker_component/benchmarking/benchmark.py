@@ -214,8 +214,16 @@ class Benchmark:
         workdir.mkdir(parents=True, exist_ok=True)
         bench_script = Path(__file__).parent / "kernel_subprocess.py"
         timing_mod = Path(__file__).parent / "timing.py"
+        backend_probe_mod = Path(__file__).parent / "backend_probe.py"
         binding_mod = Path(__file__).parent / "kernel_binding.py"
-        for src in (bench_script, timing_mod, binding_mod, kernel_file, problem_file):
+        for src in (
+            bench_script,
+            timing_mod,
+            backend_probe_mod,
+            binding_mod,
+            kernel_file,
+            problem_file,
+        ):
             (workdir / src.name).write_bytes(src.read_bytes())
 
         results_name = "benchmark_results.json"
@@ -271,6 +279,9 @@ class Benchmark:
         if remote_config.is_remote_enabled(remote_cfg):
             return self._benchmark_pytorch_remote(remote_cfg, problem_file, kernel_file)
 
+        from triton_kernel_agent.opt_worker_component.benchmarking.backend_probe import (
+            inspect_pytorch_backend,
+        )
         from triton_kernel_agent.opt_worker_component.benchmarking.timing import (
             compute_timing_stats,
             prepare_pytorch_model,
@@ -285,6 +296,7 @@ class Benchmark:
                     device="cuda",
                     dtype=dtype,
                 )
+                backend = inspect_pytorch_backend(model, inputs)
 
                 if self.timing_method == "do_bench":
                     times = time_with_triton_do_bench(
@@ -309,6 +321,7 @@ class Benchmark:
                 return {
                     "time_ms": stats["mean"],
                     "stats": stats,
+                    "backend": backend,
                 }
 
         except Exception as e:
@@ -341,8 +354,16 @@ class Benchmark:
             workdir.mkdir(parents=True, exist_ok=True)
             bench_script = Path(__file__).parent / "kernel_subprocess.py"
             timing_mod = Path(__file__).parent / "timing.py"
+            backend_probe_mod = Path(__file__).parent / "backend_probe.py"
             binding_mod = Path(__file__).parent / "kernel_binding.py"
-            for src in (bench_script, timing_mod, binding_mod, kernel_file, problem_file):
+            for src in (
+                bench_script,
+                timing_mod,
+                backend_probe_mod,
+                binding_mod,
+                kernel_file,
+                problem_file,
+            ):
                 (workdir / src.name).write_bytes(src.read_bytes())
 
             results_name = "pytorch_baseline.json"
@@ -364,7 +385,10 @@ class Benchmark:
             with open(results_json, "r") as f:
                 results = json.load(f)
             ref = results.get("kernels", {}).get("pytorch_reference", {})
-            return {"time_ms": ref.get("time_ms", float("inf"))}
+            return {
+                "time_ms": ref.get("time_ms", float("inf")),
+                "backend": ref.get("backend"),
+            }
 
     def benchmark_pytorch_compile(
         self,

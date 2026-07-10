@@ -21,6 +21,7 @@ run ncu there, and pull the CSV back. Transport is mocked (no real SSH).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -157,3 +158,72 @@ class TestBenchmarkRemoteNoDeadlock:
             result = bench.benchmark_kernel(kernel, problem)
 
         assert result["time_ms"] == 2.0
+
+    def test_remote_pytorch_backend_metadata_is_returned(self, tmp_path):
+        import logging
+        import threading
+        from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+            Benchmark,
+        )
+
+        kernel = tmp_path / "initial_kernel.py"
+        kernel.write_text("# kernel\n", encoding="utf-8")
+        problem = tmp_path / "problem.py"
+        problem.write_text("# problem\n", encoding="utf-8")
+        backend = {
+            "schema_version": 1,
+            "libraries": {
+                "cublas": {
+                    "status": "detected",
+                    "detected": True,
+                    "confidence": "high",
+                    "evidence": ["cublasLt::matmul_kernel"],
+                },
+                "cudnn": {
+                    "status": "not_detected",
+                    "detected": False,
+                    "confidence": "medium",
+                    "evidence": [],
+                },
+            },
+            "warnings": [],
+        }
+        captured = {}
+
+        def fake_run_cmd(c, workdir, command, *, artifacts, timeout_s):
+            captured["command"] = command
+            captured["workdir"] = workdir
+            (workdir / artifacts[0]).write_text(
+                json.dumps(
+                    {
+                        "kernels": {
+                            "pytorch_reference": {
+                                "time_ms": 1.5,
+                                "backend": backend,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 0, "ok", ""
+
+        bench = Benchmark(
+            logger=logging.getLogger("t"),
+            artifacts_dir=tmp_path,
+            benchmark_lock=threading.Lock(),
+            worker_id=-1,
+            warmup=1,
+            repeat=1,
+        )
+        cfg = {"kind": "ssh", "hostname": "box", "workspace": ""}
+        with patch("utils.remote_config.load_remote_config", return_value=cfg), \
+             patch(
+                 "utils.remote_exec.run_command_with_artifacts",
+                 side_effect=fake_run_cmd,
+             ):
+            result = bench.benchmark_pytorch(problem, kernel_file=kernel)
+
+        assert result == {"time_ms": 1.5, "backend": backend}
+        assert "--baseline" in captured["command"]
+        assert (captured["workdir"] / "backend_probe.py").exists()
