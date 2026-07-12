@@ -65,6 +65,8 @@ class TrajectoryWriter:
         pytorch_ms: float | None,
         sol_pct: float,
         bottleneck: str,
+        kernel_performance: dict[str, Any] | None = None,
+        pytorch_performance: dict[str, Any] | None = None,
     ) -> None:
         self._append(
             {
@@ -74,6 +76,8 @@ class TrajectoryWriter:
                 "pytorch_ms": _clean_ms(pytorch_ms),
                 "combined_sol_pct": sol_pct,
                 "bottleneck": bottleneck,
+                "kernel_performance": kernel_performance,
+                "pytorch_performance": pytorch_performance,
             }
         )
 
@@ -106,6 +110,7 @@ class TrajectoryWriter:
         is_best: bool,
         verified: bool,
         kernel_file: str | None = None,
+        performance: dict[str, Any] | None = None,
     ) -> None:
         clean_time = _clean_ms(time_ms)
         clean_base = _clean_ms(baseline_ms)
@@ -131,6 +136,7 @@ class TrajectoryWriter:
                 "is_best": bool(is_best),
                 "verified": bool(verified),
                 "kernel_file": kernel_file,
+                "performance": performance,
             }
         )
 

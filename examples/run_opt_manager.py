@@ -93,6 +93,22 @@ def print_result(result: dict, strategy_name: str, kernel_dir: Path) -> None:
         print(f"{strategy_name} OPTIMIZATION SUCCESSFUL!")
         print("=" * 80)
         print(f"Best time: {result['best_time_ms']:.4f} ms")
+        performance = result.get("best_performance") or {}
+        if performance.get("achieved_tflops") is not None:
+            mfu = performance.get("mfu_pct")
+            attainable_util = performance.get("roofline_utilization_pct")
+            mfu_text = f"{mfu:.2f}%" if mfu is not None else "unknown"
+            attainable_text = (
+                f"{attainable_util:.2f}%"
+                if attainable_util is not None
+                else "unknown"
+            )
+            print(
+                "Best compute: "
+                f"{performance['achieved_tflops']:.2f} TFLOPS, "
+                f"MFU={mfu_text}, "
+                f"attainable utilization={attainable_text}"
+            )
         print(f"Total rounds: {result['total_rounds']}")
         print(f"Top kernels found: {len(result['top_kernels'])}")
 

@@ -40,3 +40,58 @@ def get_inputs():
 
 def get_init_inputs():
     return [num_classes]
+
+
+def get_workload_spec():
+    """AlexNet first-conv tensor work and semantic minimum tensor traffic."""
+    in_channels = 3
+    out_channels = 96
+    input_height = input_width = 224
+    kernel_size = 11
+    stride = 4
+    padding = 2
+    groups = 1
+    output_height = (input_height + 2 * padding - kernel_size) // stride + 1
+    output_width = (input_width + 2 * padding - kernel_size) // stride + 1
+    output_elements = (
+        batch_size * out_channels * output_height * output_width
+    )
+    input_elements = (
+        batch_size * in_channels * input_height * input_width
+    )
+    weight_elements = (
+        out_channels * in_channels * kernel_size * kernel_size // groups
+    )
+    conv_flops = (
+        2
+        * output_elements
+        * in_channels
+        * kernel_size
+        * kernel_size
+        // groups
+    )
+    return {
+        "operation": "conv2d",
+        "flops": conv_flops,
+        "epilogue_flops": output_elements,  # Conv bias add.
+        "minimum_io_elements": (
+            input_elements + weight_elements + out_channels + output_elements
+        ),
+        "flop_convention": "2_per_fma",
+        "flop_scope": "primary_tensor_math",
+        "io_scope": "semantic_minimum",
+        "details": {
+            "batch": batch_size,
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "input_height": input_height,
+            "input_width": input_width,
+            "output_height": output_height,
+            "output_width": output_width,
+            "kernel_height": kernel_size,
+            "kernel_width": kernel_size,
+            "stride": stride,
+            "padding": padding,
+            "groups": groups,
+        },
+    }

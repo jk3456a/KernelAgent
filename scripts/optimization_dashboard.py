@@ -394,6 +394,8 @@ function render(data, runId) {
   const base = rows.find(x=>x.kind==="baseline");
   const rounds = rows.filter(x=>x.kind==="round");
   const baseMs = base ? base.time_ms : null;
+  const baseKernelPerf = base ? (base.kernel_performance||{}) : {};
+  const basePytorchPerf = base ? (base.pytorch_performance||{}) : {};
   const timed = rounds.filter(x=>x.time_ms);
   const best = timed.length ? timed.reduce((a,b)=>b.time_ms<a.time_ms?b:a) : null;
   const main = document.getElementById("main");
@@ -403,10 +405,13 @@ function render(data, runId) {
       <div>best<b>${fmt(best?best.time_ms:null)} ms</b></div>
       <div>speedup<b>${best&&baseMs?fmt(baseMs/best.time_ms,2)+'×':'—'}</b></div>
       <div>pytorch ref<b>${fmt(base?base.pytorch_ms:null)} ms</b></div>
+      <div>baseline MFU<b>${fmt(baseKernelPerf.mfu_pct,1)}%</b></div>
+      <div>pytorch MFU<b>${fmt(basePytorchPerf.mfu_pct,1)}%</b></div>
     </div>
     <canvas id="chart" height="240"></canvas>
     <table><thead><tr><th>r</th><th>this round (ms)</th><th>best (ms)</th><th>speedup</th>
-      <th>Δ%</th><th>tensor SOL%</th><th>bottleneck</th><th>config Δ</th><th>status</th><th>attempts</th>
+      <th>Δ%</th><th>TFLOPS</th><th>MFU%</th><th>attainable util%</th>
+      <th>tensor SOL%</th><th>bottleneck</th><th>config Δ</th><th>status</th><th>attempts</th>
     </tr></thead><tbody>${rounds.map(rowHtml).join("")}</tbody></table>`;
   drawChart(baseMs, rounds);
   RENDERED = runId;
@@ -457,6 +462,7 @@ function rowHtml(r) {
   // This round's own measured time vs the reverted best-so-far, so repeated
   // "best" values don't hide that each round tried a new (slower) kernel.
   const rr = r.round_result;
+  const perf = r.performance || (rr&&rr.performance) || {};
   let thisRound = "—";
   if (rr && rr.new_time_ms != null) {
     const rev = rr.reverted ? ' <span class="chg">↩reverted</span>' : "";
@@ -469,6 +475,8 @@ function rowHtml(r) {
     det("llm-reply", "LLM reply", r.opt_reply) + det("reflexion", "reflexion", r.reflexion);
   return `<tr class="${cls}"><td>${r.round}</td><td>${thisRound}</td><td>${bestSoFar}</td>
     <td>${fmt(r.speedup_vs_baseline,2)}×</td><td>${fmt(r.improvement_pct,1)}</td>
+    <td>${fmt(perf.achieved_tflops,2)}</td><td>${fmt(perf.mfu_pct,1)}</td>
+    <td>${fmt(perf.roofline_utilization_pct,1)}</td>
     <td>${fmt(r.ncu?r.ncu.tensor_sol:r.combined_sol_pct,1)}</td><td>${r.bottleneck||"—"} ${tma}</td>
     <td>${cfg}</td><td>${statusBadge}</td><td>${attempts}</td></tr>`;
 }

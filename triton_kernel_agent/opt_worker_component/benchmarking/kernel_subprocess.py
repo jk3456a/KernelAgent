@@ -32,6 +32,12 @@ import sys
 from pathlib import Path
 
 from backend_probe import inspect_pytorch_backend
+from performance_metrics import (
+    compute_latency_performance,
+    infer_kernel_math_mode,
+    infer_pytorch_math_mode,
+    resolve_workload_spec,
+)
 from timing import (
     bind_kernel_function,
     import_module,
@@ -211,6 +217,23 @@ def _save_results(results: dict[str, Any], path: Path) -> None:
     print(f"Results saved to: {path}")
 
 
+def _load_workload(problem_file: Path, dtype: torch.dtype) -> dict[str, Any]:
+    """Load an optional semantic workload specification from ``problem.py``."""
+    try:
+        problem_mod = import_module(problem_file, "problem_workload")
+        get_workload_spec = getattr(problem_mod, "get_workload_spec", None)
+        raw_spec = get_workload_spec() if get_workload_spec is not None else None
+        return resolve_workload_spec(raw_spec, dtype)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "dtype": str(dtype).removeprefix("torch."),
+            "warnings": [
+                f"failed to load workload spec: {type(exc).__name__}: {exc}"
+            ],
+        }
+
+
 def main():
     args = _parse_args()
 
@@ -222,6 +245,7 @@ def main():
     }[args.dtype]
 
     # Auto-detect dtype from kernel source (matches NCU wrapper's dtype inference)
+    kernel_source = ""
     try:
         kernel_source = args.kernel.read_text()
         if "bfloat16" in kernel_source.lower():
@@ -250,6 +274,7 @@ def main():
         print(f"❌ Failed to load problem: {exc}")
         sys.exit(1)
 
+    workload = _load_workload(args.problem, dtype)
     results: dict[str, Any] = {
         "problem": str(args.problem),
         "size": args.size,
@@ -257,6 +282,7 @@ def main():
         "dtype": str(dtype),
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "workload": workload,
         "kernels": {},
     }
 
@@ -269,10 +295,15 @@ def main():
         baseline_time = _benchmark(
             lambda: baseline_model(*inputs), "PyTorch", args.warmup, args.repeat
         )
+        baseline_performance = compute_latency_performance(workload, baseline_time)
+        baseline_performance["math_mode_hint"] = infer_pytorch_math_mode(
+            workload, backend
+        )
         results["kernels"]["pytorch_reference"] = {
             "time_ms": baseline_time,
             "speedup": 1.0,
             "backend": backend,
+            "performance": baseline_performance,
         }
         if not args.quiet:
             print()
@@ -318,7 +349,15 @@ def main():
     kernel_time = _benchmark(
         kernel_invoke, kernel_name, args.warmup, args.repeat
     )
-    results["kernels"][kernel_name] = {"time_ms": kernel_time, "path": str(args.kernel)}
+    kernel_performance = compute_latency_performance(workload, kernel_time)
+    kernel_performance["math_mode_hint"] = infer_kernel_math_mode(
+        kernel_source, dtype
+    )
+    results["kernels"][kernel_name] = {
+        "time_ms": kernel_time,
+        "path": str(args.kernel),
+        "performance": kernel_performance,
+    }
 
     # Calculate speedup
     if baseline_time is not None and kernel_time != float("inf"):

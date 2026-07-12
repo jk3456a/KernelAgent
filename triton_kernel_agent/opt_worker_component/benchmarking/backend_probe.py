@@ -217,6 +217,9 @@ def inspect_pytorch_backend(model: Any, inputs: Iterable[Any]) -> dict[str, Any]
                 "pytorch_config": {
                     "cudnn_enabled": getattr(cudnn_backend, "enabled", None),
                     "cudnn_benchmark": getattr(cudnn_backend, "benchmark", None),
+                    "cudnn_allow_tf32": getattr(
+                        cudnn_backend, "allow_tf32", None
+                    ),
                     "matmul_allow_tf32": getattr(
                         matmul_backend, "allow_tf32", None
                     ),

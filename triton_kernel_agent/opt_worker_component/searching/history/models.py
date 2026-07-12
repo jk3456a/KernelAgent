@@ -27,6 +27,10 @@ class ProgramMetrics:
     """Performance metrics for a program."""
 
     time_ms: float
+    achieved_tflops: float | None = None
+    mfu_pct: float | None = None
+    roofline_attainable_tflops: float | None = None
+    roofline_utilization_pct: float | None = None
 
 
 @dataclass

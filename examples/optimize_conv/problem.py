@@ -46,3 +46,47 @@ def get_inputs():
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, bias_shape]
+
+
+def get_workload_spec():
+    """Conv tensor-math FLOPs plus separately reported fused epilogue work."""
+    output_height = height - kernel_size + 1
+    output_width = width - kernel_size + 1
+    output_elements = (
+        batch_size * out_channels * output_height * output_width
+    )
+    input_elements = batch_size * in_channels * height * width
+    weight_elements = (
+        out_channels * in_channels * kernel_size * kernel_size
+    )
+    conv_flops = (
+        2 * output_elements * in_channels * kernel_size * kernel_size
+    )
+    return {
+        "operation": "conv2d_relu_bias_add",
+        "flops": conv_flops,
+        # Conv bias + the post-ReLU broadcast bias. ReLU is a comparison.
+        "epilogue_flops": 2 * output_elements,
+        "minimum_io_elements": (
+            input_elements
+            + weight_elements
+            + out_channels
+            + output_elements
+            + out_channels
+        ),
+        "flop_convention": "2_per_fma",
+        "flop_scope": "primary_tensor_math",
+        "io_scope": "semantic_minimum",
+        "details": {
+            "batch": batch_size,
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "input_height": height,
+            "input_width": width,
+            "output_height": output_height,
+            "output_width": output_width,
+            "kernel_height": kernel_size,
+            "kernel_width": kernel_size,
+            "groups": 1,
+        },
+    }

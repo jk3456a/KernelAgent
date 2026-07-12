@@ -24,13 +24,25 @@ from triton_kernel_agent.opt_worker_component.searching.trajectory import Trajec
 def _make_run(run_dir, rounds):
     run_dir.mkdir(parents=True, exist_ok=True)
     w = TrajectoryWriter(run_dir / "trajectory.jsonl")
-    w.record_baseline(time_ms=16.0, pytorch_ms=1.4, sol_pct=2.0, bottleneck="memory")
+    w.record_baseline(
+        time_ms=16.0,
+        pytorch_ms=1.4,
+        sol_pct=2.0,
+        bottleneck="memory",
+        kernel_performance={"achieved_tflops": 10.0, "mfu_pct": 20.0},
+        pytorch_performance={"achieved_tflops": 12.0, "mfu_pct": 24.0},
+    )
     for n, t in rounds:
         w.record_round(
             round_num=n, time_ms=t, baseline_ms=16.0,
             improvement_pct=0.0, compute_sol_pct=0.0, memory_sol_pct=0.0,
             combined_sol_pct=0.0, bottleneck="memory", config_changes={},
             is_improvement=t < 16.0, is_best=False, verified=t == t,
+            performance={
+                "achieved_tflops": 160.0 / t,
+                "mfu_pct": 32.0,
+                "roofline_utilization_pct": 40.0,
+            },
         )
         # Per-round detail lives in the worker artifact dir, as the real run does.
         art = run_dir / "workers" / "w0" / f"r{n}" / "artifacts"
@@ -80,6 +92,10 @@ def test_load_run_attaches_artifacts(tmp_path):
     assert r["strategy"][0]["category"] == "underutilized"
     assert r["strategy"][0]["root_causes"][0]["fixes"][0]["fix"] == "try TMA"
     assert r["used_tma"] is False  # kernel stub has no TMA calls
+    assert r["performance"]["mfu_pct"] == 32.0
+    baseline = next(row for row in data["rows"] if row["kind"] == "baseline")
+    assert baseline["kernel_performance"]["mfu_pct"] == 20.0
+    assert baseline["pytorch_performance"]["mfu_pct"] == 24.0
 
 
 def test_load_run_rejects_escape(tmp_path):

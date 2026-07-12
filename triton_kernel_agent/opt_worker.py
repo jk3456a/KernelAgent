@@ -276,6 +276,7 @@ class OptimizationWorker:
             worker_id=self.worker_id,
             warmup=self.benchmark_warmup,
             repeat=self.benchmark_repeat,
+            gpu_specs=self.gpu_specs,
         )
 
         # Profiler

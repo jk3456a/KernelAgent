@@ -135,6 +135,14 @@ class JSONProgramDatabase(ProgramDatabase):
             "kernel_code": entry.kernel_code,
             "metrics": {
                 "time_ms": entry.metrics.time_ms,
+                "achieved_tflops": entry.metrics.achieved_tflops,
+                "mfu_pct": entry.metrics.mfu_pct,
+                "roofline_attainable_tflops": (
+                    entry.metrics.roofline_attainable_tflops
+                ),
+                "roofline_utilization_pct": (
+                    entry.metrics.roofline_utilization_pct
+                ),
             },
             "problem_id": entry.problem_id,
             "parent_id": entry.parent_id,
@@ -147,6 +155,14 @@ class JSONProgramDatabase(ProgramDatabase):
         metrics_dict = d.get("metrics", {})
         metrics = ProgramMetrics(
             time_ms=metrics_dict.get("time_ms", float("inf")),
+            achieved_tflops=metrics_dict.get("achieved_tflops"),
+            mfu_pct=metrics_dict.get("mfu_pct"),
+            roofline_attainable_tflops=metrics_dict.get(
+                "roofline_attainable_tflops"
+            ),
+            roofline_utilization_pct=metrics_dict.get(
+                "roofline_utilization_pct"
+            ),
         )
 
         created_at = d.get("created_at")

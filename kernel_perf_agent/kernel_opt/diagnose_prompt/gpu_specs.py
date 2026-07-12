@@ -49,8 +49,9 @@ def get_gpu_specs(gpu_name: str) -> dict[str, Any] | None:
         - name: GPU name
         - architecture: GPU architecture (e.g., "Ampere", "Hopper")
         - peak_fp32_tflops: Peak FP32 compute performance in TFLOPS
-        - peak_fp16_tflops: Peak FP16 compute performance in TFLOPS
-        - peak_bf16_tflops: Peak BF16 compute performance in TFLOPS (0 if not supported)
+        - peak_tf32_tflops: Dense Tensor Core TF32 performance in TFLOPS
+        - peak_fp16_tflops: Dense Tensor Core FP16 performance in TFLOPS
+        - peak_bf16_tflops: Dense Tensor Core BF16 performance in TFLOPS
         - peak_memory_bw_gbps: Peak memory bandwidth in GB/s
         - sm_count: Number of streaming multiprocessors
         - max_threads_per_sm: Maximum threads per SM

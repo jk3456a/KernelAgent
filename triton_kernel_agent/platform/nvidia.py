@@ -31,6 +31,9 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from triton_kernel_agent.opt_worker_component.benchmarking.performance_metrics import (
+    format_performance_summary,
+)
 from triton_kernel_agent.platform.interfaces import (
     AcceleratorSpecsProvider,
     BottleneckAnalyzerBase,
@@ -106,12 +109,23 @@ class NvidiaBenchmarker(KernelBenchmarker):
         benchmark_lock: Any,
         warmup: int = 25,
         repeat: int = 100,
+        worker_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.log_dir = log_dir
         self.logger = logger
         self.benchmark_lock = benchmark_lock
         self.warmup = warmup
         self.repeat = repeat
+        self.last_kernel_result: dict[str, Any] | None = None
+        self.last_reference_result: dict[str, Any] | None = None
+        gpu_name = (worker_kwargs or {}).get("gpu_name")
+        self.gpu_specs = None
+        if gpu_name:
+            from kernel_perf_agent.kernel_opt.diagnose_prompt.gpu_specs import (
+                get_gpu_specs,
+            )
+
+            self.gpu_specs = get_gpu_specs(gpu_name)
 
     def _get_benchmarker(self):
         from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
@@ -127,7 +141,20 @@ class NvidiaBenchmarker(KernelBenchmarker):
             worker_id=-1,
             warmup=self.warmup,
             repeat=self.repeat,
+            gpu_specs=self.gpu_specs,
         )
+
+    def _log_performance(
+        self, label: str, result: dict[str, Any]
+    ) -> None:
+        performance = result.get("performance")
+        if not isinstance(performance, dict):
+            return
+        self.logger.info(
+            f"{label} compute: {format_performance_summary(performance)}"
+        )
+        for warning in performance.get("warnings", []):
+            self.logger.warning(f"{label} performance: {warning}")
 
     def benchmark_kernel(
         self,
@@ -142,10 +169,12 @@ class NvidiaBenchmarker(KernelBenchmarker):
         kernel_file.write_text(kernel_code, encoding="utf-8")
 
         result = benchmarker.benchmark_kernel(kernel_file, problem_file)
+        self.last_kernel_result = result
         kernel_time = result.get("time_ms", float("inf"))
 
         if kernel_time != float("inf"):
             self.logger.info(f"Initial kernel time: {kernel_time:.4f}ms")
+            self._log_performance("Initial kernel", result)
 
         return kernel_time
 
@@ -162,11 +191,13 @@ class NvidiaBenchmarker(KernelBenchmarker):
         initial_kernel = artifacts_dir / "initial_kernel.py"
         kernel_file = initial_kernel if initial_kernel.exists() else None
         result = benchmarker.benchmark_pytorch(problem_file, kernel_file=kernel_file)
+        self.last_reference_result = result
         pytorch_time = result.get("time_ms", float("inf"))
         backend = result.get("backend")
 
         if pytorch_time != float("inf"):
             self.logger.info(f"PyTorch baseline: {pytorch_time:.4f}ms")
+            self._log_performance("PyTorch baseline", result)
         if isinstance(backend, dict):
             backend_path = artifacts_dir / "pytorch_backend.json"
             try:
@@ -404,6 +435,7 @@ def _nvidia_worker_process(
                 "worker_id": worker_id,
                 "kernel_code": best_kernel,
                 "time_ms": metrics.get("best_time_ms", float("inf")),
+                "performance": metrics.get("best_performance"),
                 "parent_id": parent_id,
                 "attempt": attempt_data,
                 "reflexion": reflexion_data,

@@ -37,3 +37,17 @@ def get_inputs():
 
 def get_init_inputs():
     return []  # No special initialization inputs needed
+
+
+def get_workload_spec():
+    """Semantic work used for throughput/MFU reporting (one FMA = two FLOPs)."""
+    return {
+        "operation": "gemm",
+        "flops": 2 * N * N * N,
+        "epilogue_flops": 0,
+        "minimum_io_elements": 3 * N * N,  # read A/B once, write C once
+        "flop_convention": "2_per_fma",
+        "flop_scope": "primary_tensor_math",
+        "io_scope": "semantic_minimum",
+        "details": {"M": N, "N": N, "K": N},
+    }

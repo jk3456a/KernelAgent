@@ -188,6 +188,30 @@ class TestBenchmarkRemoteNoDeadlock:
             },
             "warnings": [],
         }
+        workload = {
+            "status": "available",
+            "operation": "gemm",
+            "dtype": "bfloat16",
+            "flops": 150_000_000_000,
+            "minimum_io_bytes": 100_000_000,
+            "arithmetic_intensity_flops_per_byte": 1500.0,
+            "warnings": [],
+        }
+        performance = {
+            "status": "throughput_only",
+            "time_ms": 1.5,
+            "achieved_tflops": 100.0,
+            "mfu_pct": None,
+            "dense_peak_tflops": None,
+            "roofline_attainable_tflops": None,
+            "roofline_utilization_pct": None,
+            "limiting_resource": None,
+            "math_mode": None,
+            "math_mode_hint": None,
+            "peak_source": None,
+            "gpu_name": None,
+            "warnings": [],
+        }
         captured = {}
 
         def fake_run_cmd(c, workdir, command, *, artifacts, timeout_s):
@@ -196,10 +220,12 @@ class TestBenchmarkRemoteNoDeadlock:
             (workdir / artifacts[0]).write_text(
                 json.dumps(
                     {
+                        "workload": workload,
                         "kernels": {
                             "pytorch_reference": {
                                 "time_ms": 1.5,
                                 "backend": backend,
+                                "performance": performance,
                             }
                         }
                     }
@@ -215,6 +241,12 @@ class TestBenchmarkRemoteNoDeadlock:
             worker_id=-1,
             warmup=1,
             repeat=1,
+            gpu_specs={
+                "name": "test-gpu",
+                "peak_bf16_tflops": 1000.0,
+                "peak_memory_bw_gbps": 1000.0,
+                "mfu_supported": True,
+            },
         )
         cfg = {"kind": "ssh", "hostname": "box", "workspace": ""}
         with patch("utils.remote_config.load_remote_config", return_value=cfg), \
@@ -224,6 +256,17 @@ class TestBenchmarkRemoteNoDeadlock:
              ):
             result = bench.benchmark_pytorch(problem, kernel_file=kernel)
 
-        assert result == {"time_ms": 1.5, "backend": backend}
+        assert result["time_ms"] == 1.5
+        assert result["backend"] == backend
+        assert result["workload"] == workload
+        assert result["performance"]["mfu_pct"] == 10.0
+        assert result["performance"]["roofline_utilization_pct"] == 10.0
         assert "--baseline" in captured["command"]
         assert (captured["workdir"] / "backend_probe.py").exists()
+        assert (captured["workdir"] / "performance_metrics.py").exists()
+        artifact = json.loads(
+            (tmp_path / "performance_metrics.json").read_text()
+        )
+        assert artifact["benchmarks"]["pytorch_reference"]["performance"][
+            "mfu_pct"
+        ] == 10.0

@@ -21,6 +21,8 @@ specific SKU variants for multi-SKU GPUs like A100 and H100.
 
 Sources:
 - NVIDIA official specifications and datasheets
+- H100 product table: https://www.nvidia.com/en-us/data-center/h100/
+  (asterisked Tensor Core values include sparsity; dense MFU peaks are half)
 - TechPowerUp GPU Database
 - Manufacturer datasheets
 
@@ -35,8 +37,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA A100 SXM4 40GB",
         "architecture": "Ampere",
         "peak_fp32_tflops": 19.5,
+        "peak_tf32_tflops": 156.0,  # Dense Tensor Core
         "peak_fp16_tflops": 312.0,  # Without sparsity
         "peak_bf16_tflops": 312.0,  # Without sparsity
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 1555,
         "sm_count": 108,
         "max_threads_per_sm": 2048,
@@ -51,8 +55,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA A100 SXM4 80GB",
         "architecture": "Ampere",
         "peak_fp32_tflops": 19.5,
+        "peak_tf32_tflops": 156.0,  # Dense Tensor Core
         "peak_fp16_tflops": 312.0,  # Without sparsity
         "peak_bf16_tflops": 312.0,  # Without sparsity
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 2039,
         "sm_count": 108,
         "max_threads_per_sm": 2048,
@@ -68,8 +74,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA A100 PCIe 40GB",
         "architecture": "Ampere",
         "peak_fp32_tflops": 19.5,
+        "peak_tf32_tflops": 156.0,  # Dense Tensor Core
         "peak_fp16_tflops": 312.0,  # Without sparsity
         "peak_bf16_tflops": 312.0,  # Without sparsity
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 1555,
         "sm_count": 108,
         "max_threads_per_sm": 2048,
@@ -84,8 +92,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA A100 PCIe 80GB",
         "architecture": "Ampere",
         "peak_fp32_tflops": 19.5,
+        "peak_tf32_tflops": 156.0,  # Dense Tensor Core
         "peak_fp16_tflops": 312.0,  # Without sparsity
         "peak_bf16_tflops": 312.0,  # Without sparsity
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 1935,
         "sm_count": 108,
         "max_threads_per_sm": 2048,
@@ -101,8 +111,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA H100 SXM5 80GB",
         "architecture": "Hopper",
         "peak_fp32_tflops": 67.0,
-        "peak_fp16_tflops": 1979.0,  # Without sparsity
-        "peak_bf16_tflops": 1979.0,  # Without sparsity
+        "peak_tf32_tflops": 494.5,  # Dense; NVIDIA lists 989 with sparsity
+        "peak_fp16_tflops": 989.5,  # Dense; NVIDIA lists 1979 with sparsity
+        "peak_bf16_tflops": 989.5,  # Dense; NVIDIA lists 1979 with sparsity
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 3350,
         "sm_count": 132,
         "max_threads_per_sm": 2048,
@@ -118,8 +130,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA H100 PCIe 80GB",
         "architecture": "Hopper",
         "peak_fp32_tflops": 51.0,
-        "peak_fp16_tflops": 1513.0,  # Without sparsity
-        "peak_bf16_tflops": 1513.0,  # Without sparsity
+        "peak_tf32_tflops": 378.0,  # Dense Tensor Core
+        "peak_fp16_tflops": 756.0,  # Dense Tensor Core
+        "peak_bf16_tflops": 756.0,  # Dense Tensor Core
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 2000,
         "sm_count": 114,
         "max_threads_per_sm": 2048,
@@ -135,8 +149,10 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "name": "NVIDIA H100 NVL 94GB",
         "architecture": "Hopper",
         "peak_fp32_tflops": 60.0,
-        "peak_fp16_tflops": 1671.0,  # Without sparsity
-        "peak_bf16_tflops": 1671.0,  # Without sparsity
+        "peak_tf32_tflops": 417.5,  # Dense; NVIDIA lists 835 with sparsity
+        "peak_fp16_tflops": 835.5,  # Dense; NVIDIA lists 1671 with sparsity
+        "peak_bf16_tflops": 835.5,  # Dense; NVIDIA lists 1671 with sparsity
+        "mfu_supported": True,
         "peak_memory_bw_gbps": 3900,
         "sm_count": 132,
         "max_threads_per_sm": 2048,
@@ -154,6 +170,7 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "peak_fp32_tflops": 82.58,
         "peak_fp16_tflops": 82.58,
         "peak_bf16_tflops": 82.58,
+        "mfu_supported": False,  # Dense Tensor Core peak not modeled here.
         "peak_memory_bw_gbps": 1008,
         "sm_count": 128,
         "max_threads_per_sm": 1536,
@@ -171,6 +188,7 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "peak_fp32_tflops": 56.28,
         "peak_fp16_tflops": 56.28,
         "peak_bf16_tflops": 56.28,
+        "mfu_supported": False,  # Dense Tensor Core peak not modeled here.
         "peak_memory_bw_gbps": 960,
         "sm_count": 84,
         "max_threads_per_sm": 1536,

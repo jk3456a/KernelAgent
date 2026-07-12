@@ -27,6 +27,9 @@ from typing import Any
 
 from kernel_perf_agent.kernel_opt.diagnose_prompt.judger_prompt import BottleneckResult
 from kernel_perf_agent.kernel_opt.roofline.ncu_roofline import RooflineAnalyzer
+from triton_kernel_agent.opt_worker_component.benchmarking.performance_metrics import (
+    format_performance_summary,
+)
 from triton_kernel_agent.prompt_manager import PromptManager
 from triton_kernel_agent.worker import VerificationWorker
 from triton_kernel_agent.worker_util import _write_kernel_file
@@ -83,6 +86,10 @@ class OptimizationAttempt:
     compute_sol_pct: float = 0.0
     memory_sol_pct: float = 0.0
     combined_sol_pct: float = 0.0
+    achieved_tflops: float | None = None
+    mfu_pct: float | None = None
+    roofline_attainable_tflops: float | None = None
+    roofline_utilization_pct: float | None = None
     passed_verification: bool = False
     error_message: str = ""
 
@@ -114,6 +121,13 @@ class OptimizationAttempt:
                 f"**NCU SOL (% of Peak)**: Combined: {self.combined_sol_pct:.1f}%, "
                 f"Compute: {self.compute_sol_pct:.1f}%, Memory: {self.memory_sol_pct:.1f}%"
             )
+            if self.achieved_tflops is not None:
+                lines.append(
+                    f"**Workload Throughput**: {self.achieved_tflops:.2f} TFLOPS, "
+                    f"MFU: {self.mfu_pct:.2f}%"
+                    if self.mfu_pct is not None
+                    else f"**Workload Throughput**: {self.achieved_tflops:.2f} TFLOPS"
+                )
         else:
             lines.append(
                 f"**Error**: {self.error_message[:200] if self.error_message else 'Unknown'}"
@@ -362,6 +376,7 @@ class OptimizationOrchestrator:
         best_runtime_kernel = kernel_code
         best_runtime_time = best_time
         best_runtime_sol = baseline_sol
+        best_runtime_performance = baseline_results.get("performance")
 
         best_sol_kernel = kernel_code
         best_sol_time = best_time
@@ -504,6 +519,12 @@ class OptimizationOrchestrator:
                 kernel_file_round, problem_file
             )
             new_time = bench_results["time_ms"]
+            new_performance = bench_results.get("performance")
+            if isinstance(new_performance, dict):
+                self.logger.info(
+                    f"[{round_num}] Kernel compute: "
+                    f"{format_performance_summary(new_performance)}"
+                )
 
             # Profile the NEW kernel to get its SOL metrics
             new_kernel_metrics = self._profile_kernel_for_sol(
@@ -535,6 +556,17 @@ class OptimizationOrchestrator:
             current_attempt.passed_verification = True
             any_verified = True
             current_attempt.config_changes = config_changes
+            if isinstance(new_performance, dict):
+                current_attempt.achieved_tflops = new_performance.get(
+                    "achieved_tflops"
+                )
+                current_attempt.mfu_pct = new_performance.get("mfu_pct")
+                current_attempt.roofline_attainable_tflops = (
+                    new_performance.get("roofline_attainable_tflops")
+                )
+                current_attempt.roofline_utilization_pct = (
+                    new_performance.get("roofline_utilization_pct")
+                )
 
             # Record THIS round's own measured time (the bare new-kernel time),
             # distinct from the best-so-far the revert logic keeps. Without this
@@ -552,6 +584,7 @@ class OptimizationOrchestrator:
                     "improvement_pct": improvement_pct,
                     "is_improvement": bool(new_time < best_runtime_time),
                     "reverted": bool(new_time >= best_runtime_time),
+                    "performance": new_performance,
                 }),
                 encoding="utf-8",
             )
@@ -576,6 +609,7 @@ class OptimizationOrchestrator:
 
             # Update kernels using two-kernel tracking
             # This keeps best-runtime and best-SOL kernels separate to avoid metric mixing
+            is_new_runtime_best = new_time < best_runtime_time
             (
                 current_kernel,
                 best_runtime_kernel,
@@ -597,6 +631,8 @@ class OptimizationOrchestrator:
                 best_sol_sol,
                 round_num,
             )
+            if is_new_runtime_best:
+                best_runtime_performance = new_performance
 
             # Track metadata when new best runtime is found
             if new_time < best_runtime_time or new_sol > best_sol_sol:
@@ -666,6 +702,7 @@ class OptimizationOrchestrator:
             best_sol_time,
             best_sol_sol,
             baseline_results,
+            best_runtime_performance,
             pytorch_baseline_time,
             max_opt_rounds,
             best_ncu_metrics,
@@ -677,7 +714,7 @@ class OptimizationOrchestrator:
 
     def _benchmark_baseline(
         self, kernel_code: str, problem_file: Path, known_kernel_time: float | None
-    ) -> tuple[float, dict[str, float], float | None, float]:
+    ) -> tuple[float, dict[str, Any], float | None, float]:
         """Benchmark baseline kernel and PyTorch, and profile baseline SOL.
 
         Returns:
@@ -702,6 +739,12 @@ class OptimizationOrchestrator:
             )
             best_time = baseline_results["time_ms"]
             self.logger.info(f"📊 Baseline time: {best_time:.4f} ms")
+            baseline_performance = baseline_results.get("performance")
+            if isinstance(baseline_performance, dict):
+                self.logger.info(
+                    "📊 Baseline compute: "
+                    + format_performance_summary(baseline_performance)
+                )
 
         # Profile baseline kernel for SOL metrics
         baseline_metrics = self._profile_kernel_for_sol(kernel_code, problem_file, 0)
@@ -1193,7 +1236,8 @@ class OptimizationOrchestrator:
         best_sol_kernel: str,
         best_sol_time: float,
         best_sol_sol: float,
-        baseline_results: dict[str, float],
+        baseline_results: dict[str, Any],
+        best_runtime_performance: dict[str, Any] | None,
         pytorch_baseline_time: float | None,
         rounds: int,
         ncu_metrics: dict[str, Any] | None = None,
@@ -1225,6 +1269,11 @@ class OptimizationOrchestrator:
         self.logger.info("📊 Final Results - BEST BY RUNTIME:")
         self.logger.info(f"   Time: {best_runtime_time:.4f} ms")
         self.logger.info(f"   SOL:  {best_runtime_sol:.1f}%")
+        if isinstance(best_runtime_performance, dict):
+            self.logger.info(
+                "   Compute: "
+                + format_performance_summary(best_runtime_performance)
+            )
         self.logger.info(f"   Baseline time: {baseline_results['time_ms']:.4f} ms")
         self.logger.info(f"   Speedup vs baseline: {baseline_speedup:.2f}x")
 
@@ -1252,6 +1301,8 @@ class OptimizationOrchestrator:
             "best_runtime_sol_pct": best_runtime_sol,
             "speedup": baseline_speedup,
             "rounds": rounds,
+            "baseline_performance": baseline_results.get("performance"),
+            "best_performance": best_runtime_performance,
         }
 
         # Include best-SOL kernel info if different

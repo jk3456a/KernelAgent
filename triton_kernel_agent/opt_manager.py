@@ -39,6 +39,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from triton_kernel_agent.opt_worker_component.benchmarking.performance_metrics import (
+    format_performance_summary,
+)
 from triton_kernel_agent.opt_worker_component.searching.history.json_db import (
     JSONProgramDatabase,
 )
@@ -361,6 +364,12 @@ class OptimizationManager:
 
         # Benchmark PyTorch baseline once (before spawning workers)
         pytorch_baseline = self._benchmark_pytorch_baseline(problem_file)
+        initial_benchmark_result = getattr(
+            self.benchmarker, "last_kernel_result", None
+        )
+        pytorch_benchmark_result = getattr(
+            self.benchmarker, "last_reference_result", None
+        )
 
         # Benchmark torch.compile baseline
         pytorch_compile_time = self._benchmark_pytorch_compile(problem_file)
@@ -378,6 +387,16 @@ class OptimizationManager:
             pytorch_ms=pytorch_baseline,
             sol_pct=0.0,
             bottleneck="unknown",
+            kernel_performance=(
+                initial_benchmark_result.get("performance")
+                if isinstance(initial_benchmark_result, dict)
+                else None
+            ),
+            pytorch_performance=(
+                pytorch_benchmark_result.get("performance")
+                if isinstance(pytorch_benchmark_result, dict)
+                else None
+            ),
         )
         if resume_info is not None:
             trajectory.record_resume(
@@ -442,8 +461,24 @@ class OptimizationManager:
         self.logger.info("OPTIMIZATION COMPLETE")
         self.logger.info("=" * 80)
 
+        best_performance = None
         if best:
+            best_performance = {
+                "achieved_tflops": best.metrics.achieved_tflops,
+                "mfu_pct": best.metrics.mfu_pct,
+                "roofline_attainable_tflops": (
+                    best.metrics.roofline_attainable_tflops
+                ),
+                "roofline_utilization_pct": (
+                    best.metrics.roofline_utilization_pct
+                ),
+            }
             self.logger.info(f"Best time: {best.metrics.time_ms:.4f}ms")
+            if best.metrics.achieved_tflops is not None:
+                self.logger.info(
+                    "Best compute: "
+                    + format_performance_summary(best_performance)
+                )
             if initial_kernel_time != float("inf") and best.metrics.time_ms > 0:
                 speedup = initial_kernel_time / best.metrics.time_ms
                 self.logger.info(f"Speedup vs initial kernel: {speedup:.2f}x")
@@ -459,10 +494,31 @@ class OptimizationManager:
             "pytorch_baseline_ms": pytorch_baseline,
             "pytorch_compile_ms": pytorch_compile_time,
             "initial_kernel_time_ms": initial_kernel_time,
+            "best_performance": best_performance,
+            "initial_kernel_performance": (
+                initial_benchmark_result.get("performance")
+                if isinstance(initial_benchmark_result, dict)
+                else None
+            ),
+            "pytorch_baseline_performance": (
+                pytorch_benchmark_result.get("performance")
+                if isinstance(pytorch_benchmark_result, dict)
+                else None
+            ),
             "top_kernels": [
                 {
                     "kernel_code": p.kernel_code,
                     "time_ms": p.metrics.time_ms,
+                    "performance": {
+                        "achieved_tflops": p.metrics.achieved_tflops,
+                        "mfu_pct": p.metrics.mfu_pct,
+                        "roofline_attainable_tflops": (
+                            p.metrics.roofline_attainable_tflops
+                        ),
+                        "roofline_utilization_pct": (
+                            p.metrics.roofline_utilization_pct
+                        ),
+                    },
                     "generation": p.generation,
                     "program_id": p.program_id,
                 }
@@ -567,6 +623,21 @@ class OptimizationManager:
 
         attempt = best.get("attempt") or {}
         time_ms = best.get("time_ms", float("inf"))
+        performance_fields = {
+            "achieved_tflops": attempt.get("achieved_tflops"),
+            "mfu_pct": attempt.get("mfu_pct"),
+            "roofline_attainable_tflops": attempt.get(
+                "roofline_attainable_tflops"
+            ),
+            "roofline_utilization_pct": attempt.get(
+                "roofline_utilization_pct"
+            ),
+        }
+        performance = (
+            performance_fields
+            if any(value is not None for value in performance_fields.values())
+            else None
+        )
         improvement = (
             ((baseline_ms - time_ms) / baseline_ms * 100.0)
             if baseline_ms and time_ms not in (None, float("inf")) and baseline_ms > 0
@@ -586,6 +657,7 @@ class OptimizationManager:
             is_best=True,
             verified=True,
             kernel_file=None,
+            performance=performance,
         )
 
     def _benchmark_pytorch_compile(self, problem_file: Path) -> float:

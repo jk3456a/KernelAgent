@@ -116,10 +116,21 @@ class BeamSearchStrategy(SearchStrategy):
         new_entries = []
         for result in results:
             if result.get("success"):
+                performance = result.get("performance") or {}
                 entry = ProgramEntry(
                     program_id=f"r{round_num}_w{result['worker_id']}",
                     kernel_code=result["kernel_code"],
-                    metrics=ProgramMetrics(time_ms=result["time_ms"]),
+                    metrics=ProgramMetrics(
+                        time_ms=result["time_ms"],
+                        achieved_tflops=performance.get("achieved_tflops"),
+                        mfu_pct=performance.get("mfu_pct"),
+                        roofline_attainable_tflops=performance.get(
+                            "roofline_attainable_tflops"
+                        ),
+                        roofline_utilization_pct=performance.get(
+                            "roofline_utilization_pct"
+                        ),
+                    ),
                     problem_id=self.problem_id,
                     parent_id=result.get("parent_id"),
                     generation=round_num,

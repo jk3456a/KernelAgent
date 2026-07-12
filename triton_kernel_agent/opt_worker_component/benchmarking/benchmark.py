@@ -27,6 +27,12 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from triton_kernel_agent.opt_worker_component.benchmarking.performance_metrics import (
+    add_hardware_efficiency,
+    compute_latency_performance,
+    infer_pytorch_math_mode,
+    resolve_workload_spec,
+)
 from utils import remote_config, remote_exec
 
 # ``torch`` and the in-process timing helpers are imported lazily inside the
@@ -86,6 +92,7 @@ class Benchmark:
         warmup: int = 25,
         repeat: int = 100,
         timing_method: str = "cuda_event",
+        gpu_specs: Optional[dict[str, Any]] = None,
     ):
         """Initialize the benchmark.
 
@@ -97,6 +104,7 @@ class Benchmark:
             warmup: Number of warmup iterations (or warmup time in ms for do_bench)
             repeat: Number of repeat iterations (or rep time in ms for do_bench)
             timing_method: Timing method ("cuda_event", "do_bench", "host_time")
+            gpu_specs: Optional dense compute and memory peaks for MFU/roofline
         """
         self.logger = logger
         self.artifacts_dir = artifacts_dir
@@ -104,6 +112,57 @@ class Benchmark:
         self.warmup = warmup
         self.repeat = repeat
         self.timing_method = timing_method
+        self.gpu_specs = gpu_specs
+
+    def _finalize_result(
+        self,
+        name: str,
+        result: dict[str, Any],
+        workload: dict[str, Any] | None,
+        problem_file: Path,
+    ) -> dict[str, Any]:
+        """Attach hardware efficiency and persist the benchmark observation."""
+        performance = result.get("performance")
+        if isinstance(performance, dict):
+            result["performance"] = add_hardware_efficiency(
+                performance,
+                workload,
+                self.gpu_specs,
+                math_mode=performance.get("math_mode_hint"),
+            )
+        if isinstance(workload, dict):
+            result["workload"] = workload
+        self._save_performance_result(name, result, problem_file)
+        return result
+
+    def _save_performance_result(
+        self,
+        name: str,
+        result: dict[str, Any],
+        problem_file: Path,
+    ) -> None:
+        """Merge one benchmark into the run-level performance artifact."""
+        path = self.artifacts_dir / "performance_metrics.json"
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "problem": str(problem_file),
+            "benchmarks": {},
+        }
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+            payload.setdefault("benchmarks", {})[name] = {
+                "time_ms": result.get("time_ms"),
+                "speedup": result.get("speedup"),
+                "workload": result.get("workload"),
+                "performance": result.get("performance"),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except (OSError, TypeError, ValueError) as exc:
+            self.logger.warning(f"Failed to save performance metrics: {exc}")
 
     def benchmark_kernel(
         self,
@@ -182,11 +241,17 @@ class Benchmark:
 
                 kernel_name = kernel_file.stem
                 kernel_results = results.get("kernels", {}).get(kernel_name, {})
-
-                return {
+                parsed = {
                     "time_ms": kernel_results.get("time_ms", float("inf")),
                     "speedup": kernel_results.get("speedup", 1.0),
+                    "performance": kernel_results.get("performance"),
                 }
+                return self._finalize_result(
+                    kernel_name,
+                    parsed,
+                    results.get("workload"),
+                    problem_file,
+                )
 
         except Exception as e:
             self.logger.error(f"Kernel benchmark failed: {e}")
@@ -215,11 +280,13 @@ class Benchmark:
         bench_script = Path(__file__).parent / "kernel_subprocess.py"
         timing_mod = Path(__file__).parent / "timing.py"
         backend_probe_mod = Path(__file__).parent / "backend_probe.py"
+        performance_mod = Path(__file__).parent / "performance_metrics.py"
         binding_mod = Path(__file__).parent / "kernel_binding.py"
         for src in (
             bench_script,
             timing_mod,
             backend_probe_mod,
+            performance_mod,
             binding_mod,
             kernel_file,
             problem_file,
@@ -249,10 +316,17 @@ class Benchmark:
         with open(results_json, "r") as f:
             results = json.load(f)
         kernel_results = results.get("kernels", {}).get(kernel_file.stem, {})
-        return {
+        parsed = {
             "time_ms": kernel_results.get("time_ms", float("inf")),
             "speedup": kernel_results.get("speedup", 1.0),
+            "performance": kernel_results.get("performance"),
         }
+        return self._finalize_result(
+            kernel_file.stem,
+            parsed,
+            results.get("workload"),
+            problem_file,
+        )
 
     def benchmark_pytorch(
         self,
@@ -284,6 +358,7 @@ class Benchmark:
         )
         from triton_kernel_agent.opt_worker_component.benchmarking.timing import (
             compute_timing_stats,
+            import_module,
             prepare_pytorch_model,
             time_with_cuda_events,
             time_with_triton_do_bench,
@@ -297,6 +372,24 @@ class Benchmark:
                     dtype=dtype,
                 )
                 backend = inspect_pytorch_backend(model, inputs)
+                actual_dtype = getattr(inputs[0], "dtype", dtype) if inputs else dtype
+                try:
+                    problem_mod = import_module(problem_file, "problem_workload")
+                    get_workload_spec = getattr(
+                        problem_mod, "get_workload_spec", None
+                    )
+                    raw_spec = (
+                        get_workload_spec()
+                        if get_workload_spec is not None
+                        else None
+                    )
+                    workload = resolve_workload_spec(raw_spec, actual_dtype)
+                except Exception as exc:
+                    workload = resolve_workload_spec(None, actual_dtype)
+                    workload["warnings"] = [
+                        f"failed to load workload spec: "
+                        f"{type(exc).__name__}: {exc}"
+                    ]
 
                 if self.timing_method == "do_bench":
                     times = time_with_triton_do_bench(
@@ -317,12 +410,24 @@ class Benchmark:
                     )
 
                 stats = compute_timing_stats(times)
-
-                return {
+                performance = compute_latency_performance(
+                    workload, stats["mean"]
+                )
+                performance["math_mode_hint"] = infer_pytorch_math_mode(
+                    workload, backend
+                )
+                result = {
                     "time_ms": stats["mean"],
                     "stats": stats,
                     "backend": backend,
+                    "performance": performance,
                 }
+                return self._finalize_result(
+                    "pytorch_reference",
+                    result,
+                    workload,
+                    problem_file,
+                )
 
         except Exception as e:
             self.logger.error(f"PyTorch baseline benchmark failed: {e}")
@@ -355,11 +460,13 @@ class Benchmark:
             bench_script = Path(__file__).parent / "kernel_subprocess.py"
             timing_mod = Path(__file__).parent / "timing.py"
             backend_probe_mod = Path(__file__).parent / "backend_probe.py"
+            performance_mod = Path(__file__).parent / "performance_metrics.py"
             binding_mod = Path(__file__).parent / "kernel_binding.py"
             for src in (
                 bench_script,
                 timing_mod,
                 backend_probe_mod,
+                performance_mod,
                 binding_mod,
                 kernel_file,
                 problem_file,
@@ -385,10 +492,17 @@ class Benchmark:
             with open(results_json, "r") as f:
                 results = json.load(f)
             ref = results.get("kernels", {}).get("pytorch_reference", {})
-            return {
+            parsed = {
                 "time_ms": ref.get("time_ms", float("inf")),
                 "backend": ref.get("backend"),
+                "performance": ref.get("performance"),
             }
+            return self._finalize_result(
+                "pytorch_reference",
+                parsed,
+                results.get("workload"),
+                problem_file,
+            )
 
     def benchmark_pytorch_compile(
         self,

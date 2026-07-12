@@ -30,7 +30,14 @@ from triton_kernel_agent.opt_worker_component.searching.trajectory import (
 
 def test_writes_jsonl_records_in_order(tmp_path):
     writer = TrajectoryWriter(tmp_path / "trajectory.jsonl")
-    writer.record_baseline(time_ms=15.6, pytorch_ms=1.43, sol_pct=2.0, bottleneck="memory")
+    writer.record_baseline(
+        time_ms=15.6,
+        pytorch_ms=1.43,
+        sol_pct=2.0,
+        bottleneck="memory",
+        kernel_performance={"achieved_tflops": 10.0, "mfu_pct": 20.0},
+        pytorch_performance={"achieved_tflops": 12.0, "mfu_pct": 24.0},
+    )
     writer.record_round(
         round_num=1,
         time_ms=8.0,
@@ -44,6 +51,11 @@ def test_writes_jsonl_records_in_order(tmp_path):
         is_improvement=True,
         is_best=True,
         verified=True,
+        performance={
+            "achieved_tflops": 20.0,
+            "mfu_pct": 40.0,
+            "roofline_utilization_pct": 50.0,
+        },
     )
 
     rows = read_trajectory(tmp_path / "trajectory.jsonl")
@@ -51,12 +63,15 @@ def test_writes_jsonl_records_in_order(tmp_path):
     assert rows[0]["kind"] == "baseline"
     assert rows[0]["time_ms"] == 15.6
     assert rows[0]["pytorch_ms"] == 1.43
+    assert rows[0]["kernel_performance"]["mfu_pct"] == 20.0
+    assert rows[0]["pytorch_performance"]["mfu_pct"] == 24.0
     assert rows[1]["kind"] == "round"
     assert rows[1]["round"] == 1
     # speedup vs baseline is derived for convenience
     assert abs(rows[1]["speedup_vs_baseline"] - (15.6 / 8.0)) < 1e-6
     assert rows[1]["is_best"] is True
     assert rows[1]["config_changes"] == {"BLOCK_SIZE": "256→512"}
+    assert rows[1]["performance"]["achieved_tflops"] == 20.0
 
 
 def test_each_record_has_timestamp_and_is_valid_json(tmp_path):
