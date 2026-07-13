@@ -33,6 +33,7 @@ from triton_kernel_agent.opt_worker_component.benchmarking.performance_metrics i
 from triton_kernel_agent.prompt_manager import PromptManager
 from triton_kernel_agent.worker import VerificationWorker
 from triton_kernel_agent.worker_util import _write_kernel_file
+from utils.progress import get_progress
 from utils.providers.base import BaseProvider
 
 
@@ -296,6 +297,8 @@ class OptimizationOrchestrator:
 
         # Logger
         self.logger = logger
+        self.progress = get_progress()
+        self.worker_id = getattr(verification_worker, "worker_id", None)
 
         # Optional roofline analyzer
         self.roofline_analyzer = roofline_analyzer
@@ -346,6 +349,12 @@ class OptimizationOrchestrator:
         self.logger.info("=" * 80)
         self.logger.info("Starting hardware-guided optimization")
         self.logger.info("=" * 80)
+        self.progress.emit(
+            "agent2.worker_optimize",
+            source="agent2.worker",
+            message="hardware-guided optimization started",
+            worker_id=self.worker_id,
+        )
 
         # Initialize state
         current_kernel = kernel_code
@@ -367,6 +376,12 @@ class OptimizationOrchestrator:
         self.logger.info(f"Problem: {problem_description[:100]}...")
 
         # Benchmark baseline and PyTorch (now includes baseline SOL profiling)
+        self.progress.emit(
+            "agent2.worker_baseline",
+            source="agent2.worker",
+            message="benchmarking and profiling worker baseline",
+            worker_id=self.worker_id,
+        )
         best_time, baseline_results, pytorch_baseline_time, baseline_sol = (
             self._benchmark_baseline(kernel_code, problem_file, known_kernel_time)
         )
@@ -388,6 +403,14 @@ class OptimizationOrchestrator:
             self.logger.info("=" * 80)
             self.logger.info(f"ROUND {round_num}/{max_opt_rounds}")
             self.logger.info("=" * 80)
+            self.progress.emit(
+                "agent2.worker_round",
+                source="agent2.worker",
+                message=f"worker round {round_num}/{max_opt_rounds} started",
+                worker_id=self.worker_id,
+                worker_round=round_num,
+                max_worker_rounds=max_opt_rounds,
+            )
 
             # Profile and analyze bottleneck
             bottleneck_results, roofline_result, ncu_metrics = (
@@ -515,6 +538,13 @@ class OptimizationOrchestrator:
             kernel_file_round = self.artifact_dir / f"kernel_round_{round_num}.py"
             kernel_file_round.write_text(optimized_kernel)
 
+            self.progress.emit(
+                "agent2.worker_benchmark",
+                source="agent2.worker",
+                message=f"benchmarking generated kernel for round {round_num}",
+                worker_id=self.worker_id,
+                worker_round=round_num,
+            )
             bench_results = self.benchmarker.benchmark_kernel(
                 kernel_file_round, problem_file
             )
@@ -527,6 +557,13 @@ class OptimizationOrchestrator:
                 )
 
             # Profile the NEW kernel to get its SOL metrics
+            self.progress.emit(
+                "agent2.worker_profile_new",
+                source="agent2.worker",
+                message=f"profiling generated kernel for round {round_num}",
+                worker_id=self.worker_id,
+                worker_round=round_num,
+            )
             new_kernel_metrics = self._profile_kernel_for_sol(
                 optimized_kernel, problem_file, round_num
             )
@@ -603,6 +640,13 @@ class OptimizationOrchestrator:
             self.attempt_history.append(current_attempt)
 
             # Generate reflexion for this attempt
+            self.progress.emit(
+                "agent2.worker_reflect",
+                source="agent2.worker",
+                message=f"reflecting on worker round {round_num}",
+                worker_id=self.worker_id,
+                worker_round=round_num,
+            )
             reflexion = self._generate_reflexion(current_attempt)
             if reflexion:
                 self.reflexions.append(reflexion)
@@ -676,6 +720,13 @@ class OptimizationOrchestrator:
             if final_kernel_file.exists():
                 self.logger.info(
                     f"Profiling final best kernel (round {best_round_num})..."
+                )
+                self.progress.emit(
+                    "agent2.worker_profile_final",
+                    source="agent2.worker",
+                    message=f"profiling final best kernel from round {best_round_num}",
+                    worker_id=self.worker_id,
+                    worker_round=best_round_num,
                 )
                 final_profiler_results = self.profiler.profile_kernel(
                     final_kernel_file, problem_file, best_round_num
@@ -790,6 +841,13 @@ class OptimizationOrchestrator:
             All can be None if profiling fails.
         """
         self.logger.info(f"[{round_num}] Profiling current kernel with NCU...")
+        self.progress.emit(
+            "agent2.worker_profile_current",
+            source="agent2.worker",
+            message=f"profiling current kernel for round {round_num}",
+            worker_id=self.worker_id,
+            worker_round=round_num,
+        )
         kernel_file_round = self.artifact_dir / f"kernel_round_{round_num - 1}.py"
         kernel_file_round.write_text(current_kernel)
 
@@ -809,6 +867,13 @@ class OptimizationOrchestrator:
         # Run roofline analysis
         flat_metrics = next(iter(ncu_metrics.values()), {}) if ncu_metrics else {}
         roofline_result = self.bottleneck_analyzer.roofline.analyze(flat_metrics)
+        self.progress.emit(
+            "agent2.worker_analyze",
+            source="agent2.worker",
+            message=f"analyzing bottleneck for round {round_num}",
+            worker_id=self.worker_id,
+            worker_round=round_num,
+        )
 
         # Use pre-computed bottleneck if override is set
         if self.bottleneck_override:
@@ -914,6 +979,13 @@ class OptimizationOrchestrator:
     def _generate_optimized_kernel(self, opt_prompt: str, round_num: int) -> str | None:
         """Generate optimized kernel from LLM."""
         self.logger.info(f"[{round_num}] Generating optimized kernel...")
+        self.progress.emit(
+            "agent2.worker_generate",
+            source="agent2.worker",
+            message=f"generating optimized kernel for round {round_num}",
+            worker_id=self.worker_id,
+            worker_round=round_num,
+        )
         failure_file = self.artifact_dir / f"round{round_num:03d}_failure.json"
         try:
             messages = [{"role": "user", "content": opt_prompt}]
@@ -977,6 +1049,15 @@ class OptimizationOrchestrator:
         import json as _json
 
         self.logger.warning(f"[{round_num}] generation failed ({kind}): {detail}")
+        self.progress.emit(
+            "agent2.worker_generate",
+            source="agent2.worker",
+            status="failed",
+            message=detail,
+            worker_id=self.worker_id,
+            worker_round=round_num,
+            failure_kind=kind,
+        )
         try:
             path.write_text(
                 _json.dumps({"round": round_num, "stage": "generation",
@@ -1000,12 +1081,31 @@ class OptimizationOrchestrator:
             Tuple of (success, final_kernel, error_feedback)
         """
         self.logger.info(f"[{round_num}] Verifying correctness...")
+        self.progress.emit(
+            "agent2.worker_verify",
+            source="agent2.worker",
+            message=f"verifying generated kernel for round {round_num}",
+            worker_id=self.worker_id,
+            worker_round=round_num,
+        )
         success, final_kernel, error_feedback = (
             self.verification_worker.verify_with_refinement(
                 kernel_code=optimized_kernel,
                 test_code=test_code,
                 problem_description=problem_description,
             )
+        )
+        self.progress.emit(
+            "agent2.worker_verify",
+            source="agent2.worker",
+            status="completed" if success else "failed",
+            message=(
+                "correctness check passed"
+                if success
+                else (error_feedback or "correctness check failed")
+            ),
+            worker_id=self.worker_id,
+            worker_round=round_num,
         )
 
         if success:

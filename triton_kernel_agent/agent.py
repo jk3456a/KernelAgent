@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from .manager import WorkerManager
 from .prompt_manager import PromptManager
+from utils.progress import get_progress, progress_stage
 from utils.providers import BaseProvider, get_model_provider
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
@@ -444,6 +445,12 @@ if __name__ == "__main__":
             "is disabled."
         )
 
+    @progress_stage(
+        "agent1.generate",
+        source="agent1",
+        message="generating and verifying a kernel",
+        result_ok=lambda result: bool(result and result.get("success")),
+    )
     def generate_kernel(
         self,
         problem_description: str,
@@ -470,10 +477,16 @@ if __name__ == "__main__":
         self.logger.info("=" * 60)
         self.logger.info("Starting kernel generation")
         self.logger.info(f"Problem: {problem_description[:100]}...")
+        progress = get_progress()
 
         # Normalize test_code to list[str]
         test_code_list: list[str] = []
         if generate_default_test:
+            progress.emit(
+                "agent1.generate_test",
+                source="agent1",
+                message="generating the default correctness test",
+            )
             generated = self._generate_test(problem_description, None)
             self.logger.info("Generated default test code using LLM")
             test_code_list.append(generated)
@@ -504,6 +517,12 @@ if __name__ == "__main__":
                 f.write(test_code)
 
         # Generate kernel seeds (all tests as LLM context, with labels)
+        progress.emit(
+            "agent1.generate_seeds",
+            source="agent1",
+            message="generating initial kernel candidates",
+            candidate_count=self.num_workers,
+        )
         kernel_seeds = self._generate_kernel_seeds(
             problem_description, format_test_code_for_llm(test_code_list)
         )
@@ -514,6 +533,12 @@ if __name__ == "__main__":
                 f.write(kernel)
 
         # Run parallel verification with session directory for worker logs
+        progress.emit(
+            "agent1.verify",
+            source="agent1",
+            message="verifying generated kernel candidates",
+            candidate_count=len(kernel_seeds),
+        )
         result = self.manager.run_verification(
             kernel_seeds=kernel_seeds,
             test_code=test_code_list,

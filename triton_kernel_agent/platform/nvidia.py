@@ -44,6 +44,7 @@ from triton_kernel_agent.platform.interfaces import (
     RooflineAnalyzerBase,
     WorkerRunner,
 )
+from utils.progress import get_progress
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +282,7 @@ class NvidiaWorkerRunner(WorkerRunner):
         shared_history: list[dict],
         shared_reflexions: list[dict],
     ) -> list[dict[str, Any]]:
+        progress = get_progress()
         result_queue = mp.Queue()
         workers = []
 
@@ -290,6 +292,7 @@ class NvidiaWorkerRunner(WorkerRunner):
 
             args = (
                 i,  # worker_id
+                round_num,
                 candidate["parent"].kernel_code,
                 candidate["parent"].metrics.time_ms,
                 candidate["parent"].program_id,
@@ -323,11 +326,27 @@ class NvidiaWorkerRunner(WorkerRunner):
         # KERNEL_WORKER_TIMEOUT_S.
         worker_timeout = int(os.environ.get("KERNEL_WORKER_TIMEOUT_S", "3600"))
         deadline = time.time() + worker_timeout
-        for w in workers:
+        progress.emit(
+            "agent2.worker_wait",
+            source="agent2.manager",
+            message=f"waiting for {len(workers)} workers in round {round_num}",
+            round=round_num,
+            worker_pids=[worker.pid for worker in workers],
+        )
+        for i, w in enumerate(workers):
             remaining = max(0, deadline - time.time())
             w.join(timeout=remaining)
             if w.is_alive():
                 self.logger.warning(f"Worker {w.pid} timed out, terminating")
+                progress.emit(
+                    "agent2.worker_timeout",
+                    source="agent2.manager",
+                    status="failed",
+                    message=f"worker {i} timed out after {worker_timeout}s",
+                    worker_id=i,
+                    round=round_num,
+                    worker_pid=w.pid,
+                )
                 w.terminate()
                 w.join(timeout=5)
                 if w.is_alive():
@@ -353,6 +372,16 @@ class NvidiaWorkerRunner(WorkerRunner):
             f"Round {round_num}: {successful}/{len(candidates)} workers succeeded "
             f"({len(results)} results received)"
         )
+        progress.emit(
+            "agent2.worker_wait",
+            source="agent2.manager",
+            status="completed",
+            message=f"round {round_num}: {successful}/{len(candidates)} workers succeeded",
+            round=round_num,
+            worker_count=len(candidates),
+            result_count=len(results),
+            success_count=successful,
+        )
 
         return results
 
@@ -364,6 +393,7 @@ class NvidiaWorkerRunner(WorkerRunner):
 
 def _nvidia_worker_process(
     worker_id: int,
+    manager_round: int,
     kernel_code: str,
     known_time: float,
     parent_id: str,
@@ -393,6 +423,15 @@ def _nvidia_worker_process(
     kernel_agent_path = Path(__file__).parent.parent.parent
     if str(kernel_agent_path) not in sys.path:
         sys.path.insert(0, str(kernel_agent_path))
+
+    progress = get_progress()
+    progress.bind(worker_id=worker_id, manager_round=manager_round)
+    progress.emit(
+        "agent2.worker_boot",
+        source="agent2.worker",
+        message=f"worker {worker_id} booting",
+        workdir=str(workdir),
+    )
 
     try:
         from triton_kernel_agent.opt_worker import OptimizationWorker
@@ -441,8 +480,22 @@ def _nvidia_worker_process(
                 "reflexion": reflexion_data,
             }
         )
+        progress.emit(
+            "agent2.worker",
+            source="agent2.worker",
+            message=f"worker {worker_id} completed",
+            status="completed" if success else "failed",
+            best_time_ms=metrics.get("best_time_ms"),
+        )
 
     except Exception as e:
+        progress.emit(
+            "agent2.worker",
+            source="agent2.worker",
+            message=str(e),
+            status="failed",
+            error_type=type(e).__name__,
+        )
         result_queue.put(
             {
                 "success": False,

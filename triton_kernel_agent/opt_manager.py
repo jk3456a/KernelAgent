@@ -59,6 +59,7 @@ from triton_kernel_agent.opt_worker_component.searching.strategy.greedy import (
     GreedyStrategy,
 )
 from utils.config_injectable import config_injectable
+from utils.progress import get_progress, progress_stage
 
 # Manager-level component keys resolved by the registry
 _MANAGER_LEVEL_KEYS = {"verifier", "benchmarker", "worker_runner"}
@@ -112,6 +113,7 @@ class OptimizationManager:
             **worker_kwargs: Additional kwargs passed to OptimizationWorker
         """
         self.max_rounds = max_rounds
+        self.strategy_name = strategy
         self.log_dir = (
             Path(log_dir) if log_dir else Path(tempfile.mkdtemp(prefix="opt_"))
         )
@@ -279,6 +281,12 @@ class OptimizationManager:
     # Main optimisation loop
     # ------------------------------------------------------------------
 
+    @progress_stage(
+        "agent2.optimize",
+        source="agent2.manager",
+        message="running kernel optimization",
+        result_ok=lambda result: bool(result and result.get("success")),
+    )
     def run_optimization(
         self,
         initial_kernel: str,
@@ -307,7 +315,9 @@ class OptimizationManager:
                 - top_kernels: list[dict]
         """
         max_rounds = max_rounds or self.max_rounds
+        strategy_name = self.strategy_name
         problem_file = Path(problem_file)
+        progress = get_progress()
 
         # Normalize test_code to list
         if isinstance(test_code, str):
@@ -316,6 +326,14 @@ class OptimizationManager:
         self.logger.info("=" * 80)
         self.logger.info("STARTING OPTIMIZATION")
         self.logger.info("=" * 80)
+        progress.emit(
+            "agent2.manager_start",
+            source="agent2.manager",
+            message="optimization manager started",
+            strategy=strategy_name,
+            max_rounds=max_rounds,
+            log_dir=str(self.log_dir),
+        )
 
         # Initialize strategy with starting kernel
         initial_entry = ProgramEntry(
@@ -344,7 +362,16 @@ class OptimizationManager:
             )
 
         # Verify initial kernel correctness before investing in benchmarks/optimization
-        if not self._verify_initial_kernel(initial_kernel, problem_file, test_code):
+        progress.emit(
+            "agent2.initial_verify",
+            source="agent2.manager",
+            message="verifying initial kernel",
+            strategy=strategy_name,
+        )
+        initial_ok = self._verify_initial_kernel(
+            initial_kernel, problem_file, test_code
+        )
+        if not initial_ok:
             return {
                 "success": False,
                 "kernel_code": None,
@@ -358,11 +385,23 @@ class OptimizationManager:
         # initial_kernel.py to the artifacts dir, which the remote PyTorch
         # baseline reuses to drive kernel_subprocess.py --baseline (it needs a
         # kernel alongside the problem). Order matters: baseline must come after.
+        progress.emit(
+            "agent2.initial_benchmark",
+            source="agent2.manager",
+            message="benchmarking initial kernel",
+            strategy=strategy_name,
+        )
         initial_kernel_time = self._benchmark_initial_kernel(
             initial_kernel, problem_file
         )
 
         # Benchmark PyTorch baseline once (before spawning workers)
+        progress.emit(
+            "agent2.pytorch_baseline",
+            source="agent2.manager",
+            message="benchmarking PyTorch baseline",
+            strategy=strategy_name,
+        )
         pytorch_baseline = self._benchmark_pytorch_baseline(problem_file)
         initial_benchmark_result = getattr(
             self.benchmarker, "last_kernel_result", None
@@ -372,6 +411,12 @@ class OptimizationManager:
         )
 
         # Benchmark torch.compile baseline
+        progress.emit(
+            "agent2.pytorch_compile_baseline",
+            source="agent2.manager",
+            message="benchmarking torch.compile baseline",
+            strategy=strategy_name,
+        )
         pytorch_compile_time = self._benchmark_pytorch_compile(problem_file)
 
         # Trajectory log spanning the whole optimization run (one record per
@@ -410,6 +455,14 @@ class OptimizationManager:
         for round_num in range(start_round, start_round + max_rounds):
             self.logger.info("")
             self.logger.info(f"{'=' * 20} ROUND {round_num} {'=' * 20}")
+            progress.emit(
+                "agent2.round",
+                source="agent2.manager",
+                message=f"round {round_num} started",
+                strategy=strategy_name,
+                round=round_num,
+                max_rounds=start_round + max_rounds - 1,
+            )
 
             # 1. Get candidates from strategy
             candidates = self.strategy.select_candidates(round_num)
@@ -436,9 +489,30 @@ class OptimizationManager:
                 self.logger.info(
                     f"Round {round_num} best: worker {best['worker_id']} at {best['time_ms']:.4f} ms"
                 )
+                progress.emit(
+                    "agent2.round",
+                    source="agent2.manager",
+                    status="completed",
+                    message=(
+                        f"round {round_num} best worker {best['worker_id']} "
+                        f"at {best['time_ms']:.4f} ms"
+                    ),
+                    strategy=strategy_name,
+                    round=round_num,
+                    best_worker=best["worker_id"],
+                    best_time_ms=best["time_ms"],
+                )
             else:
                 best = None
                 self.logger.info(f"Round {round_num}: no successful workers")
+                progress.emit(
+                    "agent2.round",
+                    source="agent2.manager",
+                    status="completed",
+                    message=f"round {round_num}: no successful workers",
+                    strategy=strategy_name,
+                    round=round_num,
+                )
 
             # Append this round to the trajectory. ``attempt`` (when present)
             # carries the SOL / bottleneck / config detail the worker measured.
@@ -673,20 +747,40 @@ class OptimizationManager:
         pytorch_baseline: float,
     ) -> list[dict[str, Any]]:
         """Spawn workers for each candidate and collect results."""
-        results = self.worker_runner.run_workers(
-            candidates=candidates,
-            round_num=round_num,
-            problem_file=problem_file,
-            test_code=test_code,
-            pytorch_baseline=pytorch_baseline,
-            shared_history=(
+        progress = get_progress()
+        progress.emit(
+            "agent2.workers",
+            source="agent2.manager",
+            message=f"round {round_num} workers running",
+            strategy=self.strategy_name,
+            round=round_num,
+            worker_count=len(candidates),
+        )
+        kwargs = {
+            "candidates": candidates,
+            "round_num": round_num,
+            "problem_file": problem_file,
+            "test_code": test_code,
+            "pytorch_baseline": pytorch_baseline,
+            "shared_history": (
                 self.shared_history[-self.history_size :] if self.shared_history else []
             ),
-            shared_reflexions=(
+            "shared_reflexions": (
                 self.shared_reflexions[-self.history_size :]
                 if self.shared_reflexions
                 else []
             ),
+        }
+        results = self.worker_runner.run_workers(**kwargs)
+        progress.emit(
+            "agent2.workers",
+            source="agent2.manager",
+            status="completed",
+            message=f"round {round_num} workers returned",
+            strategy=self.strategy_name,
+            round=round_num,
+            result_count=len(results),
+            success_count=sum(1 for result in results if result.get("success")),
         )
 
         # Collect history and reflexions from worker results
