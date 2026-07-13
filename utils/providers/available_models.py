@@ -86,4 +86,9 @@ AVAILABLE_MODELS = [
         provider_classes=[LLMCenterProvider],
         description="[LLM-center] GLM-5.2 via modelbest proxy (OpenAI protocol)",
     ),
+    ModelConfig(
+        name="gpt-5.6-sol",
+        provider_classes=[LLMCenterProvider],
+        description="[LLM-center] GPT-5.6 SOL via modelbest proxy (OpenAI protocol)",
+    ),
 ]

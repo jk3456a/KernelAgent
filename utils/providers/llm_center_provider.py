@@ -46,8 +46,6 @@ class LLMCenterProvider(OpenAICompatibleProvider):
 
     def get_max_tokens_limit(self, model_name: str) -> int:
         # GLM-5.2 is a reasoning model: the token budget is shared between
-        # reasoning_content and the final content. A tight cap (e.g. 32k) lets
-        # reasoning consume the whole budget and truncates the actual code to
-        # empty. Allow a very large budget so a long reasoning trace still leaves
-        # room to emit the full kernel.
-        return 1_000_000
+        # reasoning_content and the final content. llm-center currently rejects
+        # max_tokens above 128K even though the context window is larger.
+        return 131_072
