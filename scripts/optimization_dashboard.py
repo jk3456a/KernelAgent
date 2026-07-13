@@ -30,6 +30,7 @@ place.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any
 
@@ -41,16 +42,65 @@ from triton_kernel_agent.opt_worker_component.searching.trajectory import read_t
 _TRAJECTORY_GLOB = "**/trajectory.jsonl"
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively replace NaN/Infinity values with JSON ``null``."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _pipeline_run_dir(strategy_dir: Path) -> Path | None:
+    """Infer the pipeline-level directory that owns a strategy trajectory."""
+    parent = strategy_dir.parent
+    # GEMM/default layout: <pipeline>/opt_manager_logs/<strategy>/trajectory.jsonl
+    if parent.name == "opt_manager_logs":
+        return parent.parent
+    # Timestamped conv layout: <project>/runs/<timestamp>/<strategy>/trajectory.jsonl
+    if parent.parent.name == "runs":
+        return parent
+    return None
+
+
+def _run_metadata(strategy_dir: Path) -> dict[str, Any]:
+    """Build human-friendly metadata for both flat and timestamped layouts."""
+    pipeline_dir = _pipeline_run_dir(strategy_dir)
+    strategy = strategy_dir.name
+    if pipeline_dir is None:
+        return {
+            "display_name": strategy,
+            "run_name": strategy,
+            "strategy": strategy,
+            "project": strategy_dir.parent.name,
+            "pipeline_dir": None,
+            "timestamped": False,
+        }
+
+    timestamped = pipeline_dir.parent.name == "runs"
+    project = pipeline_dir.parent.parent.name if timestamped else pipeline_dir.name
+    return {
+        "display_name": pipeline_dir.name,
+        "run_name": pipeline_dir.name,
+        "strategy": strategy,
+        "project": project,
+        "pipeline_dir": str(pipeline_dir),
+        "timestamped": timestamped,
+    }
+
+
 def discover_runs(root: Path) -> list[dict[str, Any]]:
     """Find every trajectory.jsonl under *root* and summarize each run.
 
     Returns a list of run summaries (most recently modified first):
-        {id, dir, rounds, baseline_ms, best_ms, best_speedup, best_round, mtime}
+        {id, display_name, strategy, rounds, baseline_ms, best_ms, ...}
     """
     root = Path(root)
     runs: list[dict[str, Any]] = []
     for traj in root.glob(_TRAJECTORY_GLOB):
-        rows = read_trajectory(traj)
+        rows = _json_safe(read_trajectory(traj))
         if not rows:
             continue
         run_dir = traj.parent
@@ -68,6 +118,7 @@ def discover_runs(root: Path) -> list[dict[str, Any]]:
             {
                 "id": _run_id(root, run_dir),
                 "dir": str(run_dir),
+                **_run_metadata(run_dir),
                 "rounds": len(round_rows),
                 "baseline_ms": baseline_ms,
                 "best_ms": best_ms,
@@ -106,7 +157,7 @@ def load_run(root: Path, run_id: str) -> dict[str, Any]:
     # Containment check: never read outside the configured root.
     if Path(root).resolve() not in run_dir.parents and run_dir != Path(root).resolve():
         raise ValueError(f"run id escapes root: {run_id}")
-    rows = read_trajectory(run_dir / "trajectory.jsonl")
+    rows = _json_safe(read_trajectory(run_dir / "trajectory.jsonl"))
     for r in rows:
         if r.get("kind") != "round":
             continue
@@ -164,7 +215,26 @@ def load_run(root: Path, run_id: str) -> dict[str, Any]:
                 "cp.async.bulk",
             )
         )
-    return {"id": run_id, "dir": str(run_dir), "rows": rows}
+    metadata = _run_metadata(run_dir)
+    pipeline_dir = _pipeline_run_dir(run_dir)
+    initial_kernel = None
+    optimized_kernel = None
+    if pipeline_dir is not None:
+        initial_kernel = _read_if_exists(pipeline_dir / "input.py", 40000)
+        optimized_kernel = _read_if_exists(
+            pipeline_dir / f"optimized_kernel_{metadata['strategy'].lower()}.py",
+            40000,
+        )
+    return _json_safe(
+        {
+            "id": run_id,
+            "dir": str(run_dir),
+            **metadata,
+            "initial_kernel": initial_kernel,
+            "optimized_kernel": optimized_kernel,
+            "rows": rows,
+        }
+    )
 
 
 # NCU columns worth surfacing per round (short label -> full metric name).
@@ -252,7 +322,9 @@ def _read_json_if_exists(path: Path) -> Any | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        return _json_safe(
+            json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        )
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -304,6 +376,10 @@ _INDEX_HTML = """<!doctype html>
   details { margin-top:4px; } summary { cursor:pointer; color:#58a6ff; }
   pre { background:#161b22; border:1px solid #30363d; padding:8px; overflow:auto;
         max-height:340px; border-radius:6px; white-space:pre-wrap; }
+  .run-info { background:#161b22; border:1px solid #30363d; border-radius:6px;
+              padding:8px 14px; margin-bottom:12px; }
+  .run-info > b { display:block; color:#e6edf3; font-size:15px; }
+  .run-info > span { display:block; overflow-wrap:anywhere; }
   .kpi { display:flex; gap:18px; margin-bottom:12px; }
   .kpi div { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:8px 14px; }
   .kpi b { font-size:20px; color:#e6edf3; display:block; }
@@ -362,11 +438,14 @@ async function loadRuns() {
   el.innerHTML = runs.map(run => {
     const sp = run.best_speedup ? `<span class="pill up">${fmt(run.best_speedup,2)}×</span>`
                                 : `<span class="pill down">—</span>`;
-    return `<div class="run ${run.id===SEL?'sel':''}" onclick="selectRun('${run.id}')">
-      <b>${run.id}</b> ${sp}<br/>
-      <span class="muted">${run.rounds} rounds · base ${fmt(run.baseline_ms)}ms
+    const context = [run.project, run.strategy].filter(Boolean).map(esc).join(" · ");
+    return `<div class="run ${run.id===SEL?'sel':''}" data-run-id="${encodeURIComponent(run.id)}">
+      <b>${esc(run.display_name||run.id)}</b> ${sp}<br/>
+      <span class="muted">${context ? context+' · ' : ''}${run.rounds} rounds · base ${fmt(run.baseline_ms)}ms
       · best ${fmt(run.best_ms)}ms (r${run.best_round??'—'})</span></div>`;
   }).join("") || '<p class="muted" style="padding:14px">No runs found.</p>';
+  el.querySelectorAll(".run").forEach(d=>d.addEventListener("click",
+    ()=>selectRun(decodeURIComponent(d.dataset.runId))));
   // Auto-select the newest run that actually has rounds, not just a bare
   // baseline (an in-progress run shows 0 rounds and would look empty).
   if (!SEL && runs.length) {
@@ -378,7 +457,7 @@ async function loadRuns() {
 async function selectRun(id) {
   const requestId = ++REQUEST_ID;
   SEL = id; document.querySelectorAll(".run").forEach(d=>d.classList.toggle("sel",
-    d.querySelector("b")?.textContent===id));
+    decodeURIComponent(d.dataset.runId)===id));
   const r = await fetch("/api/runs/" + encodeURIComponent(id));
   const payload = await r.text();
   if (requestId !== REQUEST_ID || SEL !== id) return;
@@ -398,8 +477,22 @@ function render(data, runId) {
   const basePytorchPerf = base ? (base.pytorch_performance||{}) : {};
   const timed = rounds.filter(x=>x.time_ms);
   const best = timed.length ? timed.reduce((a,b)=>b.time_ms<a.time_ms?b:a) : null;
+  const resume = rows.find(x=>x.kind==="resume");
+  const context = [data.project, data.strategy].filter(Boolean).join(" · ");
+  const resumeInfo = resume ?
+    `<div class="ncu">resumed from ${esc(resume.resumed_from||"unknown")} at round ${resume.round??"—"}</div>` : "";
+  const runFiles =
+    (data.initial_kernel ?
+      `<details data-detail-key="run:initial-kernel"><summary>initial kernel (input.py)</summary><pre>${esc(data.initial_kernel)}</pre></details>` : "") +
+    (data.optimized_kernel ?
+      `<details data-detail-key="run:optimized-kernel"><summary>optimized kernel</summary><pre>${esc(data.optimized_kernel)}</pre></details>` : "");
   const main = document.getElementById("main");
   main.innerHTML = `
+    <div class="run-info">
+      <b>${esc(data.display_name||data.id)}</b>
+      <span class="muted">${esc(context)}${context?' · ':''}${esc(data.pipeline_dir||data.dir||"")}</span>
+      ${resumeInfo}${runFiles}
+    </div>
     <div class="kpi">
       <div>baseline<b>${fmt(baseMs)} ms</b></div>
       <div>best<b>${fmt(best?best.time_ms:null)} ms</b></div>

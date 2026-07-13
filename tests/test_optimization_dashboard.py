@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from scripts.optimization_dashboard import discover_runs, load_run
@@ -96,6 +98,94 @@ def test_load_run_attaches_artifacts(tmp_path):
     baseline = next(row for row in data["rows"] if row["kind"] == "baseline")
     assert baseline["kernel_performance"]["mfu_pct"] == 20.0
     assert baseline["pytorch_performance"]["mfu_pct"] == 24.0
+
+
+def test_gemm_timestamped_run_exposes_pipeline_metadata_and_kernels(tmp_path):
+    pipeline_dir = (
+        tmp_path
+        / "examples"
+        / "optimize_gemm"
+        / "runs"
+        / "gemm_20260710_234725"
+    )
+    strategy_dir = pipeline_dir / "opt_manager_logs" / "greedy_glm"
+    _make_run(strategy_dir, [(1, 12.0)])
+    (pipeline_dir / "input.py").write_text("# initial kernel\n", encoding="utf-8")
+    (pipeline_dir / "optimized_kernel_greedy_glm.py").write_text(
+        "# optimized kernel\n", encoding="utf-8"
+    )
+
+    run = discover_runs(tmp_path)[0]
+    assert run["display_name"] == "gemm_20260710_234725"
+    assert run["project"] == "optimize_gemm"
+    assert run["strategy"] == "greedy_glm"
+    assert run["pipeline_dir"] == str(pipeline_dir)
+    assert run["timestamped"] is True
+
+    data = load_run(tmp_path, run["id"])
+    assert data["initial_kernel"] == "# initial kernel\n"
+    assert data["optimized_kernel"] == "# optimized kernel\n"
+
+
+def test_conv_timestamped_run_metadata_without_opt_manager_logs(tmp_path):
+    pipeline_dir = (
+        tmp_path / "examples" / "optimize_conv" / "runs" / "v1_20260709_180504"
+    )
+    strategy_dir = pipeline_dir / "greedy_glm"
+    _make_run(strategy_dir, [(1, 12.0)])
+
+    run = discover_runs(tmp_path)[0]
+    assert run["display_name"] == "v1_20260709_180504"
+    assert run["project"] == "optimize_conv"
+    assert run["strategy"] == "greedy_glm"
+    assert run["pipeline_dir"] == str(pipeline_dir)
+    assert run["timestamped"] is True
+
+
+def test_flat_opt_manager_layout_remains_supported(tmp_path):
+    pipeline_dir = tmp_path / "examples" / "optimize_gemm"
+    strategy_dir = pipeline_dir / "opt_manager_logs" / "greedy_glm"
+    _make_run(strategy_dir, [(1, 12.0)])
+    (pipeline_dir / "input.py").write_text("# current input\n", encoding="utf-8")
+
+    run = discover_runs(tmp_path)[0]
+    assert run["display_name"] == "optimize_gemm"
+    assert run["project"] == "optimize_gemm"
+    assert run["strategy"] == "greedy_glm"
+    assert run["pipeline_dir"] == str(pipeline_dir)
+    assert run["timestamped"] is False
+    assert load_run(tmp_path, run["id"])["initial_kernel"] == "# current input\n"
+
+
+def test_load_run_sanitizes_nonfinite_artifact_numbers(tmp_path):
+    strategy_dir = (
+        tmp_path
+        / "examples"
+        / "optimize_gemm"
+        / "runs"
+        / "gemm_20260710_234725"
+        / "opt_manager_logs"
+        / "greedy_glm"
+    )
+    _make_run(strategy_dir, [(1, 12.0)])
+    result = (
+        strategy_dir
+        / "workers"
+        / "w0"
+        / "r1"
+        / "artifacts"
+        / "round001_result.json"
+    )
+    result.write_text(
+        '{"new_time_ms": null, "improvement_pct": -Infinity, "reverted": true}',
+        encoding="utf-8",
+    )
+
+    run = discover_runs(tmp_path)[0]
+    data = load_run(tmp_path, run["id"])
+    round_row = next(row for row in data["rows"] if row["kind"] == "round")
+    assert round_row["round_result"]["improvement_pct"] is None
+    json.dumps(data, allow_nan=False)
 
 
 def test_load_run_rejects_escape(tmp_path):
