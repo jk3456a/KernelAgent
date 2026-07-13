@@ -18,12 +18,16 @@ This module consolidates kernel and PyTorch benchmarking with improved timing
 utilities, L2 cache clearing, and comprehensive statistics.
 """
 
+import csv
 import json
 import logging
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import traceback
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -41,6 +45,25 @@ from utils import remote_config, remote_exec
 # torch-free control machine can still drive the optimization loop.
 if TYPE_CHECKING:
     import torch
+
+_NCU_BACKEND_TIMEOUT_S = int(
+    os.environ.get("KERNELAGENT_BACKEND_NCU_TIMEOUT_S", "300")
+)
+_SUPPORTED_DTYPE_NAMES = {"float32", "float16", "bfloat16"}
+
+
+def _normalize_dtype_name(dtype: Any) -> str:
+    name = str(dtype).removeprefix("torch.")
+    return name if name in _SUPPORTED_DTYPE_NAMES else "bfloat16"
+
+
+def _normalize_cuda_device(device: Any) -> str:
+    name = str(device)
+    if name == "cuda":
+        return name
+    if name.startswith("cuda:") and name.removeprefix("cuda:").isdigit():
+        return name
+    return "cuda"
 
 
 class BenchmarkLockManager:
@@ -349,10 +372,53 @@ class Benchmark:
                 - time_ms: Mean time in ms
                 - stats: Full timing statistics (mean, std, min, max, all_times, etc.)
         """
-        remote_cfg = remote_config.load_remote_config()
-        if remote_config.is_remote_enabled(remote_cfg):
-            return self._benchmark_pytorch_remote(remote_cfg, problem_file, kernel_file)
+        try:
+            remote_cfg = remote_config.load_remote_config()
+            if remote_config.is_remote_enabled(remote_cfg):
+                result, dtype_name, device_name = self._benchmark_pytorch_remote(
+                    remote_cfg,
+                    problem_file,
+                    kernel_file,
+                )
+            else:
+                result, dtype_name, device_name = self._benchmark_pytorch_local(
+                    problem_file,
+                    dtype,
+                )
 
+            backend = result.get("backend")
+            workload = result.get("workload")
+            if isinstance(backend, dict):
+                result["backend"] = self._maybe_refine_backend_with_ncu(
+                    backend=backend,
+                    workload=workload if isinstance(workload, dict) else None,
+                    problem_file=problem_file,
+                    dtype_name=dtype_name,
+                    device_name=device_name,
+                    remote_cfg=(
+                        remote_cfg
+                        if remote_config.is_remote_enabled(remote_cfg)
+                        else None
+                    ),
+                )
+
+            return self._finalize_result(
+                "pytorch_reference",
+                result,
+                workload if isinstance(workload, dict) else None,
+                problem_file,
+            )
+        except Exception as e:
+            self.logger.error(f"PyTorch baseline benchmark failed: {e}")
+            self.logger.error(traceback.format_exc())
+            return {"time_ms": float("inf")}
+
+    def _benchmark_pytorch_local(
+        self,
+        problem_file: Path,
+        dtype: Optional["torch.dtype"],
+    ) -> tuple[dict[str, Any], str, str]:
+        """Collect the primary local baseline result before optional NCU."""
         from triton_kernel_agent.opt_worker_component.benchmarking.backend_probe import (
             inspect_pytorch_backend,
         )
@@ -364,82 +430,266 @@ class Benchmark:
             time_with_triton_do_bench,
         )
 
-        try:
-            with self.lock_manager:
-                model, inputs = prepare_pytorch_model(
-                    problem_file=problem_file,
-                    device="cuda",
-                    dtype=dtype,
+        with self.lock_manager:
+            model, inputs = prepare_pytorch_model(
+                problem_file=problem_file,
+                device="cuda",
+                dtype=dtype,
+            )
+            backend = inspect_pytorch_backend(model, inputs)
+            actual_dtype = getattr(inputs[0], "dtype", dtype) if inputs else dtype
+            try:
+                problem_mod = import_module(problem_file, "problem_workload")
+                get_workload_spec = getattr(
+                    problem_mod, "get_workload_spec", None
                 )
-                backend = inspect_pytorch_backend(model, inputs)
-                actual_dtype = getattr(inputs[0], "dtype", dtype) if inputs else dtype
-                try:
-                    problem_mod = import_module(problem_file, "problem_workload")
-                    get_workload_spec = getattr(
-                        problem_mod, "get_workload_spec", None
-                    )
-                    raw_spec = (
-                        get_workload_spec()
-                        if get_workload_spec is not None
-                        else None
-                    )
-                    workload = resolve_workload_spec(raw_spec, actual_dtype)
-                except Exception as exc:
-                    workload = resolve_workload_spec(None, actual_dtype)
-                    workload["warnings"] = [
-                        f"failed to load workload spec: "
-                        f"{type(exc).__name__}: {exc}"
-                    ]
+                raw_spec = (
+                    get_workload_spec()
+                    if get_workload_spec is not None
+                    else None
+                )
+                workload = resolve_workload_spec(raw_spec, actual_dtype)
+            except Exception as exc:
+                workload = resolve_workload_spec(None, actual_dtype)
+                workload["warnings"] = [
+                    f"failed to load workload spec: "
+                    f"{type(exc).__name__}: {exc}"
+                ]
 
-                if self.timing_method == "do_bench":
-                    times = time_with_triton_do_bench(
-                        lambda: model(*inputs),
-                        [],
-                        warmup=self.warmup,
-                        rep=self.repeat,
-                        verbose=False,
-                    )
-                else:  # cuda_event
-                    times = time_with_cuda_events(
-                        lambda: model(*inputs),
-                        [],
-                        num_warmup=self.warmup,
-                        num_trials=self.repeat,
-                        clear_cache=True,
-                        verbose=False,
-                    )
+            if self.timing_method == "do_bench":
+                times = time_with_triton_do_bench(
+                    lambda: model(*inputs),
+                    [],
+                    warmup=self.warmup,
+                    rep=self.repeat,
+                    verbose=False,
+                )
+            else:  # cuda_event
+                times = time_with_cuda_events(
+                    lambda: model(*inputs),
+                    [],
+                    num_warmup=self.warmup,
+                    num_trials=self.repeat,
+                    clear_cache=True,
+                    verbose=False,
+                )
 
-                stats = compute_timing_stats(times)
-                performance = compute_latency_performance(
-                    workload, stats["mean"]
-                )
-                performance["math_mode_hint"] = infer_pytorch_math_mode(
-                    workload, backend
-                )
-                result = {
+            stats = compute_timing_stats(times)
+            performance = compute_latency_performance(workload, stats["mean"])
+            performance["math_mode_hint"] = infer_pytorch_math_mode(
+                workload, backend
+            )
+            device_name = next(
+                (
+                    str(getattr(value, "device"))
+                    for value in inputs
+                    if str(getattr(value, "device", "")).startswith("cuda")
+                ),
+                "cuda",
+            )
+            return (
+                {
                     "time_ms": stats["mean"],
                     "stats": stats,
                     "backend": backend,
                     "performance": performance,
+                    "workload": workload,
+                },
+                _normalize_dtype_name(actual_dtype),
+                _normalize_cuda_device(device_name),
+            )
+
+    def _maybe_refine_backend_with_ncu(
+        self,
+        *,
+        backend: dict[str, Any],
+        workload: dict[str, Any] | None,
+        problem_file: Path,
+        dtype_name: str,
+        device_name: str,
+        remote_cfg: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        """Run one best-effort NCU sidecar when primary evidence is weak."""
+        from triton_kernel_agent.opt_worker_component.benchmarking.backend_probe import (
+            get_backend_probe_targets,
+            get_ncu_fallback_targets,
+            merge_ncu_backend_evidence,
+            parse_ncu_kernel_names,
+        )
+
+        relevant_targets = get_backend_probe_targets(
+            workload, backend.get("aten_ops", [])
+        )
+        fallback_targets = get_ncu_fallback_targets(backend, workload)
+        if not fallback_targets:
+            return merge_ncu_backend_evidence(
+                backend,
+                ncu_status="not_requested",
+                target_libraries=relevant_targets,
+            )
+
+        def failed(status: str, message: str) -> dict[str, Any]:
+            self.logger.warning(message)
+            return merge_ncu_backend_evidence(
+                backend,
+                ncu_status=status,
+                target_libraries=fallback_targets,
+                warning=message,
+            )
+
+        self.logger.info(
+            "Refining PyTorch baseline backend with NCU for: "
+            + ", ".join(fallback_targets)
+        )
+        try:
+            probe_id = uuid.uuid4().hex
+            mode = "remote" if remote_cfg is not None else "local"
+            workdir = (
+                self.artifacts_dir
+                / f"{mode}_ncu_pytorch_backend_{probe_id}"
+            )
+            workdir.mkdir(parents=True, exist_ok=False)
+            bench_dir = Path(__file__).parent
+            probe_script = bench_dir / "kernel_subprocess.py"
+            for src in (
+                probe_script,
+                bench_dir / "timing.py",
+                bench_dir / "backend_probe.py",
+                bench_dir / "performance_metrics.py",
+                bench_dir / "kernel_binding.py",
+                problem_file,
+            ):
+                (workdir / src.name).write_bytes(src.read_bytes())
+
+            csv_name = f"pytorch_backend_ncu_{probe_id}.csv"
+            csv_path = workdir / csv_name
+            python_executable = (
+                "python3"
+                if remote_cfg is not None
+                else os.environ.get("KERNEL_PROFILER_PYTHON") or sys.executable
+            )
+            command_args = [
+                "ncu",
+                "--csv",
+                "--page=raw",
+                "--print-kernel-base=demangled",
+                "--profile-from-start=off",
+                "--replay-mode=kernel",
+                "--cache-control=none",
+                "--clock-control=none",
+                "--metrics=gpu__time_duration.sum",
+                f"--log-file={csv_name}",
+                python_executable,
+                "-u",
+                probe_script.name,
+                "--problem",
+                problem_file.name,
+                "--dtype",
+                _normalize_dtype_name(dtype_name),
+                "--device",
+                _normalize_cuda_device(device_name),
+                "--ncu-baseline-once",
+                "--quiet",
+            ]
+            primary_config = backend.get("pytorch_config", {})
+            sidecar_config = {
+                key: value
+                for key, value in primary_config.items()
+                if key
+                in {
+                    "cudnn_enabled",
+                    "cudnn_benchmark",
+                    "cudnn_allow_tf32",
+                    "matmul_allow_tf32",
                 }
-                return self._finalize_result(
-                    "pytorch_reference",
-                    result,
-                    workload,
-                    problem_file,
+                and isinstance(value, bool)
+            }
+            if sidecar_config:
+                command_args.extend(
+                    [
+                        "--pytorch-config-json",
+                        json.dumps(sidecar_config, separators=(",", ":")),
+                    ]
                 )
 
-        except Exception as e:
-            self.logger.error(f"PyTorch baseline benchmark failed: {e}")
-            self.logger.error(traceback.format_exc())
-            return {"time_ms": float("inf")}
+            if remote_cfg is not None:
+                command = " ".join(shlex.quote(arg) for arg in command_args)
+                rc, out, err = remote_exec.run_command_with_artifacts(
+                    remote_cfg,
+                    workdir,
+                    command,
+                    artifacts=[csv_name],
+                    timeout_s=_NCU_BACKEND_TIMEOUT_S,
+                )
+            else:
+                ncu_bin = shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
+                local_args = [ncu_bin, *command_args[1:]]
+                completed = subprocess.run(
+                    local_args,
+                    cwd=workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=_NCU_BACKEND_TIMEOUT_S,
+                )
+                rc, out, err = (
+                    completed.returncode,
+                    completed.stdout,
+                    completed.stderr,
+                )
+        except subprocess.TimeoutExpired:
+            return failed(
+                "failed",
+                "NCU backend refinement timed out; keeping torch.profiler result",
+            )
+        except Exception as exc:
+            return failed(
+                "failed",
+                "NCU backend refinement failed "
+                f"({type(exc).__name__}: {exc}); keeping torch.profiler result",
+            )
+
+        if rc != 0:
+            detail = (err or out).strip()[:500] or f"exit code {rc}"
+            return failed(
+                "failed",
+                f"NCU backend refinement failed ({detail}); "
+                "keeping torch.profiler result",
+            )
+        if not csv_path.exists():
+            return failed(
+                "inconclusive",
+                "NCU backend refinement returned no CSV; "
+                "keeping torch.profiler result",
+            )
+
+        try:
+            kernel_names = parse_ncu_kernel_names(csv_path)
+        except (OSError, ValueError, csv.Error) as exc:
+            return failed(
+                "inconclusive",
+                "NCU backend refinement CSV was unreadable "
+                f"({type(exc).__name__}: {exc}); keeping torch.profiler result",
+            )
+        if not kernel_names:
+            return failed(
+                "inconclusive",
+                "NCU backend refinement captured no CUDA kernels; "
+                "keeping torch.profiler result",
+            )
+
+        return merge_ncu_backend_evidence(
+            backend,
+            ncu_status="succeeded",
+            target_libraries=fallback_targets,
+            ncu_kernel_names=kernel_names,
+        )
 
     def _benchmark_pytorch_remote(
         self,
         remote_cfg: dict[str, str],
         problem_file: Path,
         kernel_file: Optional[Path],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str, str]:
         """PyTorch baseline timing on the remote GPU host.
 
         ``kernel_subprocess.py --baseline`` times the PyTorch reference alongside
@@ -452,7 +702,7 @@ class Benchmark:
                 "Remote PyTorch baseline requires a kernel_file to drive "
                 "kernel_subprocess.py --baseline; none was provided."
             )
-            return {"time_ms": float("inf")}
+            return {"time_ms": float("inf")}, "bfloat16", "cuda"
 
         with self.lock_manager:
             workdir = self.artifacts_dir / "remote_bench_pytorch"
@@ -488,7 +738,7 @@ class Benchmark:
                 self.logger.error(
                     f"Remote PyTorch baseline failed (rc={rc}): {(err or out).strip()[:500]}"
                 )
-                return {"time_ms": float("inf")}
+                return {"time_ms": float("inf")}, "bfloat16", "cuda"
             with open(results_json, "r") as f:
                 results = json.load(f)
             ref = results.get("kernels", {}).get("pytorch_reference", {})
@@ -496,12 +746,12 @@ class Benchmark:
                 "time_ms": ref.get("time_ms", float("inf")),
                 "backend": ref.get("backend"),
                 "performance": ref.get("performance"),
+                "workload": results.get("workload"),
             }
-            return self._finalize_result(
-                "pytorch_reference",
+            return (
                 parsed,
-                results.get("workload"),
-                problem_file,
+                _normalize_dtype_name(results.get("dtype")),
+                _normalize_cuda_device(results.get("device")),
             )
 
     def benchmark_pytorch_compile(

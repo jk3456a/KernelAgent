@@ -225,6 +225,15 @@ class NvidiaBenchmarker(KernelBenchmarker):
             self.logger.info(
                 "PyTorch baseline backend: " + ", ".join(summaries)
             )
+            ncu = backend.get("ncu")
+            if isinstance(ncu, dict):
+                targets = ", ".join(ncu.get("target_libraries", [])) or "none"
+                self.logger.info(
+                    "PyTorch baseline NCU refinement: "
+                    f"{ncu.get('status', 'unknown')} "
+                    f"(targets={targets}, kernels="
+                    f"{len(ncu.get('cuda_kernels', []))})"
+                )
             for warning in backend.get("warnings", []):
                 self.logger.warning(f"PyTorch backend inspection: {warning}")
 

@@ -254,9 +254,11 @@ class TestRunCommandWithArtifacts:
         (workdir / "kernel.py").write_text("# k\n", encoding="utf-8")
 
         calls = []
+        timeouts = []
 
         def fake_run(argv, capture_output, text, timeout=None):
             calls.append(argv)
+            timeouts.append(timeout)
             joined = " ".join(argv)
 
             class R:
@@ -287,6 +289,7 @@ class TestRunCommandWithArtifacts:
         assert any(c.startswith("rsync") and "bench.py" in c for c in joined_calls)
         assert any(c.startswith("ssh") and "bench.py --json" in c for c in joined_calls)
         assert any(c.startswith("rsync") and c.endswith("out.json") for c in joined_calls)
+        assert all(timeout is not None and 0 < timeout <= 120 for timeout in timeouts)
 
     def test_missing_artifact_is_tolerated(self, tmp_path):
         # A failed remote run may not produce the artifact; pull is best-effort

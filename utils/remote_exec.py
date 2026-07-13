@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 __all__ = ["build_remote_argv", "run_workdir_tests", "run_command_with_artifacts"]
@@ -134,24 +135,46 @@ def _build_rsync_argv(hostname: str, sources: list[Path], remote_workdir: str) -
     return cmd
 
 
-def _push_candidate(hostname: str, sources: list[Path], remote_workdir: str) -> None:
+def _remaining_timeout(
+    deadline: float | None,
+    command: list[str],
+) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(command, 0)
+    return remaining
+
+
+def _push_candidate(
+    hostname: str,
+    sources: list[Path],
+    remote_workdir: str,
+    *,
+    deadline: float | None = None,
+) -> None:
     """Create the remote workdir and rsync the run files into it.
 
     Fail fast (RuntimeError) on mkdir/rsync failure — a half-pushed workdir
     must not be executed.
     """
+    mkdir_argv = _build_mkdir_argv(hostname, remote_workdir)
     mkdir = subprocess.run(
-        _build_mkdir_argv(hostname, remote_workdir),
+        mkdir_argv,
         capture_output=True, text=True,
+        timeout=_remaining_timeout(deadline, mkdir_argv),
     )
     if mkdir.returncode != 0:
         raise RuntimeError(
             f"remote mkdir failed on {hostname}:{remote_workdir} "
             f"(exit {mkdir.returncode}): {mkdir.stderr.strip()}"
         )
+    rsync_argv = _build_rsync_argv(hostname, sources, remote_workdir)
     rsync = subprocess.run(
-        _build_rsync_argv(hostname, sources, remote_workdir),
+        rsync_argv,
         capture_output=True, text=True,
+        timeout=_remaining_timeout(deadline, rsync_argv),
     )
     if rsync.returncode != 0:
         raise RuntimeError(
@@ -293,19 +316,30 @@ def run_command_with_artifacts(
     """
     hostname = cfg["hostname"]
     remote_workdir = _remote_workdir(cfg.get("workspace", ""), workdir)
+    deadline = time.monotonic() + timeout_s
 
     sources = sorted(p for p in workdir.iterdir() if p.is_file())
-    _push_candidate(hostname, sources, remote_workdir)
+    _push_candidate(hostname, sources, remote_workdir, deadline=deadline)
 
     remote_cmd = _build_command_script(remote_workdir, command)
     argv = _build_ssh_argv(hostname, remote_cmd)
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=_remaining_timeout(deadline, argv),
+    )
 
     # Pull artifacts back regardless of rc — a profiler may write a partial CSV
     # that the caller still inspects; missing files just fail the pull quietly.
     for artifact in artifacts:
         pull = _build_pull_argv(hostname, remote_workdir, artifact, workdir / artifact)
-        subprocess.run(pull, capture_output=True, text=True)
+        subprocess.run(
+            pull,
+            capture_output=True,
+            text=True,
+            timeout=_remaining_timeout(deadline, pull),
+        )
 
     return completed.returncode, completed.stdout, completed.stderr
 

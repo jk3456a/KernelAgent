@@ -7,8 +7,11 @@ machine without a CUDA PyTorch installation.
 
 from __future__ import annotations
 
+import copy
+import csv
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 
@@ -37,6 +40,10 @@ _VENDOR_GEMM_RE = re.compile(
 )
 _MAX_RECORDED_NAMES = 32
 _MAX_EVIDENCE_NAMES = 8
+_CUBLAS_OPERATION_MARKERS = ("gemm", "matmul", "linear", "bmm", "addmm")
+_CUDNN_OPERATION_MARKERS = ("conv", "convolution")
+_CONFIDENCE_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
+_NCU_STATUSES = {"not_requested", "succeeded", "inconclusive", "failed"}
 
 
 def _unique_names(names: Iterable[str], limit: int | None = None) -> list[str]:
@@ -71,6 +78,8 @@ def _library_result(
 def classify_backend_events(
     aten_ops: Iterable[str],
     cuda_kernels: Iterable[str],
+    *,
+    target_libraries: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Classify cuBLAS/cuDNN use from one eager-forward profiler trace.
 
@@ -80,13 +89,14 @@ def classify_backend_events(
     """
     aten_names = _unique_names(aten_ops)
     kernel_names = _unique_names(cuda_kernels)
+    targets = set(_unique_names(target_libraries))
     aten_lower = [name.lower() for name in aten_names]
     kernel_lower = [(name, name.lower()) for name in kernel_names]
 
-    has_matmul = any(
+    has_matmul = "cublas" in targets or any(
         any(marker in name for marker in _MATMUL_ATEN_OPS) for name in aten_lower
     )
-    has_conv = any(
+    has_conv = "cudnn" in targets or any(
         any(marker in name for marker in _CONV_ATEN_OPS) for name in aten_lower
     )
 
@@ -136,6 +146,213 @@ def classify_backend_events(
             "cudnn": cudnn,
         },
     }
+
+
+def get_backend_probe_targets(
+    workload: dict[str, Any] | None,
+    aten_ops: Iterable[str],
+) -> list[str]:
+    """Return workload-relevant CUDA libraries in stable order.
+
+    Workload metadata is preferred because profiler failures can leave no ATen
+    events. ATen events are a fallback for problems without an operation label.
+    """
+    operation = ""
+    if isinstance(workload, dict):
+        operation = str(workload.get("operation") or "").strip().lower()
+
+    targets: list[str] = []
+    if operation:
+        if any(marker in operation for marker in _CUBLAS_OPERATION_MARKERS):
+            targets.append("cublas")
+        if any(marker in operation for marker in _CUDNN_OPERATION_MARKERS):
+            targets.append("cudnn")
+        if targets:
+            return targets
+
+    aten_lower = [str(name).lower() for name in aten_ops]
+    if any(
+        any(marker in name for marker in _MATMUL_ATEN_OPS) for name in aten_lower
+    ):
+        targets.append("cublas")
+    if any(
+        any(marker in name for marker in _CONV_ATEN_OPS) for name in aten_lower
+    ):
+        targets.append("cudnn")
+    return targets
+
+
+def get_ncu_fallback_targets(
+    backend: dict[str, Any] | None,
+    workload: dict[str, Any] | None,
+) -> list[str]:
+    """Return relevant libraries whose primary evidence needs NCU refinement."""
+    if not isinstance(backend, dict):
+        return []
+
+    targets = get_backend_probe_targets(workload, backend.get("aten_ops", []))
+    libraries = backend.get("libraries", {})
+    fallback_targets: list[str] = []
+    for library in targets:
+        info = libraries.get(library, {}) if isinstance(libraries, dict) else {}
+        status = info.get("status", "unknown")
+        confidence = info.get("confidence", "none")
+        if status == "unknown" or confidence in {"none", "low", "medium"}:
+            fallback_targets.append(library)
+    return fallback_targets
+
+
+def parse_ncu_kernel_names(csv_path: str | Path) -> list[str]:
+    """Extract every unique kernel name from an NCU raw CSV artifact."""
+    path = Path(csv_path)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    header_index: int | None = None
+    for index, line in enumerate(lines):
+        try:
+            fields = next(csv.reader([line]))
+        except csv.Error:
+            continue
+        normalized = {field.strip().strip('"') for field in fields}
+        if "ID" in normalized and "Kernel Name" in normalized:
+            header_index = index
+            break
+
+    if header_index is None:
+        raise ValueError("NCU CSV does not contain an ID/Kernel Name header")
+
+    reader = csv.DictReader(lines[header_index:])
+    names: list[str] = []
+    for row in reader:
+        name = str(row.get("Kernel Name") or "").strip()
+        if not name or name == "Kernel Name":
+            continue
+        names.append(name)
+    return _unique_names(names)
+
+
+def _confidence_max(first: str, second: str) -> str:
+    return max(
+        (first, second),
+        key=lambda value: _CONFIDENCE_RANK.get(value, 0),
+    )
+
+
+def _merge_library_evidence(
+    primary: dict[str, Any],
+    ncu: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge two name-based observations without inventing negative evidence."""
+    primary_status = primary.get("status", "unknown")
+    ncu_status = ncu.get("status", "unknown")
+    primary_confidence = primary.get("confidence", "none")
+    ncu_confidence = ncu.get("confidence", "none")
+    evidence = _unique_names(
+        [
+            *primary.get("evidence", []),
+            *ncu.get("evidence", []),
+        ],
+        _MAX_EVIDENCE_NAMES,
+    )
+    conflict = {primary_status, ncu_status} == {"detected", "not_detected"}
+
+    if ncu_status == "unknown":
+        merged = copy.deepcopy(primary)
+    elif primary_status == "unknown":
+        merged = copy.deepcopy(ncu)
+    elif primary_status == ncu_status:
+        merged = copy.deepcopy(primary)
+        merged["confidence"] = _confidence_max(
+            primary_confidence, ncu_confidence
+        )
+        merged["detected"] = {
+            "detected": True,
+            "not_detected": False,
+        }.get(primary_status)
+    elif conflict:
+        detected_source = primary if primary_status == "detected" else ncu
+        detected_confidence = detected_source.get("confidence", "none")
+        if detected_confidence == "high" and primary_status == "detected":
+            merged = copy.deepcopy(primary)
+        elif ncu_status == "detected":
+            merged = _library_result("detected", "medium", evidence)
+        else:
+            merged = _library_result("unknown", "none", evidence)
+    else:
+        merged = copy.deepcopy(primary)
+
+    merged["evidence"] = evidence
+    merged["sources"] = ["torch.profiler", "ncu"]
+    merged["conflict"] = conflict
+    return merged
+
+
+def merge_ncu_backend_evidence(
+    primary: dict[str, Any],
+    *,
+    ncu_status: str,
+    target_libraries: Iterable[str],
+    ncu_kernel_names: Iterable[str] = (),
+    warning: str | None = None,
+) -> dict[str, Any]:
+    """Attach optional NCU evidence while preserving the v1 top-level contract."""
+    if ncu_status not in _NCU_STATUSES:
+        raise ValueError(f"Unsupported NCU backend status: {ncu_status}")
+
+    result = copy.deepcopy(primary)
+    targets = _unique_names(target_libraries)
+    kernel_names = _unique_names(ncu_kernel_names)
+    ncu_classification = classify_backend_events(
+        result.get("aten_ops", []),
+        kernel_names,
+        target_libraries=targets,
+    )
+    ncu_libraries = {
+        library: ncu_classification["libraries"].get(
+            library, _library_result("unknown", "none")
+        )
+        for library in targets
+    }
+
+    libraries = result.setdefault("libraries", {})
+    for library, info in libraries.items():
+        normalized = copy.deepcopy(info)
+        normalized.setdefault("sources", ["torch.profiler"])
+        normalized.setdefault("conflict", False)
+        libraries[library] = normalized
+
+    if ncu_status == "succeeded":
+        for library in targets:
+            primary_info = libraries.get(
+                library, _library_result("unknown", "none")
+            )
+            libraries[library] = _merge_library_evidence(
+                primary_info,
+                ncu_libraries[library],
+            )
+
+    warnings = list(result.get("warnings", []))
+    if warning:
+        warnings.append(warning)
+
+    methods = ["torch.profiler"]
+    if ncu_status != "not_requested":
+        methods.append("ncu")
+    result.update(
+        {
+            "schema_version": 2,
+            "methods": methods,
+            "ncu": {
+                "status": ncu_status,
+                "target_libraries": targets,
+                "cuda_kernels": kernel_names[:_MAX_RECORDED_NAMES],
+                "libraries": ncu_libraries,
+                "warnings": [warning] if warning else [],
+            },
+            "warnings": _unique_names(warnings),
+        }
+    )
+    return result
 
 
 def _unknown_probe_result(warning: str) -> dict[str, Any]:

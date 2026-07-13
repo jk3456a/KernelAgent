@@ -47,6 +47,34 @@ lazily, only on the local path. So a torch-free laptop can drive the full
 generate→verify→profile→optimize loop as long as the LLM is reachable locally
 and the GPU host is reachable over SSH.
 
+### PyTorch baseline cuBLAS/cuDNN evidence
+
+The eager PyTorch baseline records which CUDA library appears to execute its
+workload. `torch.profiler` is the primary probe. For GEMM/matmul/linear
+workloads it evaluates cuBLAS; for convolution workloads it evaluates cuDNN.
+An unrelated library's medium-confidence `not_detected` result does not trigger
+extra profiling.
+
+If the relevant library remains `unknown` or medium-confidence, agent2 launches
+one best-effort NCU sidecar. The sidecar uses
+`cudaProfilerStart`/`cudaProfilerStop` around exactly one eager forward and
+`ncu --profile-from-start=off`, then merges the demangled kernel names with the
+primary evidence. NCU failure, timeout, missing permissions, or an empty CSV
+does not fail the baseline benchmark; the original profiler result is retained
+with an `ncu.status` of `failed` or `inconclusive`. Override the sidecar timeout
+with `KERNELAGENT_BACKEND_NCU_TIMEOUT_S` (default: 300 seconds).
+
+The merged schema is written to `artifacts/pytorch_backend.json`, logged with
+the baseline result, and returned from `OptimizationManager.run_optimization()`
+as `pytorch_baseline_backend`. The top-level library fields remain
+`status`, `detected`, `confidence`, and `evidence`; schema v2 additionally
+records evidence sources, conflicts, and the NCU probe status.
+
+This is kernel-launch evidence, not an API-call audit. A kernel name containing
+cuBLAS/cuDNN is strong evidence, but a missing or renamed symbol cannot prove
+that `cublasLtMatmul` or `cudnnConvolutionForward` was never called. Use CUPTI
+callbacks or an Nsight Systems API trace when host API-level proof is required.
+
 ## Configure
 
 Pick **either** a TOML file **or** environment variables (env overrides TOML
@@ -84,6 +112,8 @@ These also work in KernelAgent's `.env` file.
    identity) so plain `ssh <hostname> <cmd>` works without extra flags.
 2. `rsync` 3.x on the remote non-interactive `$PATH`.
 3. `torch` + `triton` importable on the remote default `python3`.
+4. `ncu` on the non-interactive `$PATH` for candidate profiling and optional
+   baseline backend refinement.
 
 Candidates run under `<workspace>/.kernelagent_remote/<attempt_id>/`. Triton and
 Inductor compile caches persist at `$HOME/.cache/{triton,inductor}-persistent`

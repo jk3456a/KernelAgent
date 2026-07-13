@@ -22,8 +22,10 @@ run ncu there, and pull the CSV back. Transport is mocked (no real SSH).
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import subprocess
 from unittest.mock import patch
+
+import pytest
 
 from kernel_perf_agent.kernel_opt.profiler import ncu_profiler
 
@@ -257,7 +259,10 @@ class TestBenchmarkRemoteNoDeadlock:
             result = bench.benchmark_pytorch(problem, kernel_file=kernel)
 
         assert result["time_ms"] == 1.5
-        assert result["backend"] == backend
+        assert result["backend"]["schema_version"] == 2
+        assert result["backend"]["libraries"]["cublas"]["status"] == "detected"
+        assert result["backend"]["libraries"]["cublas"]["confidence"] == "high"
+        assert result["backend"]["ncu"]["status"] == "not_requested"
         assert result["workload"] == workload
         assert result["performance"]["mfu_pct"] == 10.0
         assert result["performance"]["roofline_utilization_pct"] == 10.0
@@ -270,3 +275,188 @@ class TestBenchmarkRemoteNoDeadlock:
         assert artifact["benchmarks"]["pytorch_reference"]["performance"][
             "mfu_pct"
         ] == 10.0
+
+    def test_weak_backend_triggers_one_remote_ncu_sidecar(self, tmp_path):
+        import logging
+        import threading
+        from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+            Benchmark,
+        )
+
+        kernel = tmp_path / "initial_kernel.py"
+        kernel.write_text("# kernel\n", encoding="utf-8")
+        problem = tmp_path / "problem.py"
+        problem.write_text("# problem\n", encoding="utf-8")
+        backend = {
+            "schema_version": 1,
+            "method": "torch.profiler",
+            "aten_ops": ["aten::matmul"],
+            "cuda_kernels": ["ampere_bf16_s16816gemm_bf16_128x128"],
+            "libraries": {
+                "cublas": {
+                    "status": "detected",
+                    "detected": True,
+                    "confidence": "medium",
+                    "evidence": ["ampere_bf16_s16816gemm_bf16_128x128"],
+                },
+                "cudnn": {
+                    "status": "not_detected",
+                    "detected": False,
+                    "confidence": "medium",
+                    "evidence": [],
+                },
+            },
+            "warnings": [],
+        }
+        workload = {"status": "available", "operation": "gemm"}
+        calls = []
+
+        def fake_run_cmd(c, workdir, command, *, artifacts, timeout_s):
+            calls.append((workdir, command, artifacts))
+            if "--ncu-baseline-once" not in command:
+                (workdir / artifacts[0]).write_text(
+                    json.dumps(
+                        {
+                            "dtype": "torch.bfloat16",
+                            "workload": workload,
+                            "kernels": {
+                                "pytorch_reference": {
+                                    "time_ms": 1.5,
+                                    "backend": backend,
+                                    "performance": None,
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                (workdir / artifacts[0]).write_text(
+                    '"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+                    '"1","cublasLt::matmul_kernel","gpu__time_duration.sum",'
+                    '"nsecond","42"\n',
+                    encoding="utf-8",
+                )
+            return 0, "ok", ""
+
+        bench = Benchmark(
+            logger=logging.getLogger("ncu-fallback"),
+            artifacts_dir=tmp_path,
+            benchmark_lock=threading.Lock(),
+            worker_id=-1,
+            warmup=1,
+            repeat=1,
+        )
+        cfg = {"kind": "ssh", "hostname": "box", "workspace": ""}
+        with patch("utils.remote_config.load_remote_config", return_value=cfg), \
+             patch(
+                 "utils.remote_exec.run_command_with_artifacts",
+                 side_effect=fake_run_cmd,
+             ):
+            result = bench.benchmark_pytorch(problem, kernel_file=kernel)
+
+        assert len(calls) == 2
+        _, ncu_command, ncu_artifacts = calls[1]
+        assert "--ncu-baseline-once" in ncu_command
+        assert "--profile-from-start=off" in ncu_command
+        assert "--launch-count" not in ncu_command
+        assert "--launch-skip" not in ncu_command
+        assert ncu_artifacts[0].startswith("pytorch_backend_ncu_")
+        assert result["time_ms"] == 1.5
+        assert result["backend"]["ncu"]["status"] == "succeeded"
+        assert result["backend"]["libraries"]["cublas"]["status"] == "detected"
+        assert result["backend"]["libraries"]["cublas"]["confidence"] == "high"
+
+    @pytest.mark.parametrize(
+        ("failure", "expected_status"),
+        [
+            ("nonzero", "failed"),
+            ("timeout", "failed"),
+            ("missing_csv", "inconclusive"),
+        ],
+    )
+    def test_remote_ncu_failure_keeps_baseline(
+        self, tmp_path, failure, expected_status
+    ):
+        import logging
+        import threading
+        from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+            Benchmark,
+        )
+
+        kernel = tmp_path / "initial_kernel.py"
+        kernel.write_text("# kernel\n", encoding="utf-8")
+        problem = tmp_path / "problem.py"
+        problem.write_text("# problem\n", encoding="utf-8")
+        calls = 0
+
+        def fake_run_cmd(c, workdir, command, *, artifacts, timeout_s):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                (workdir / artifacts[0]).write_text(
+                    json.dumps(
+                        {
+                            "dtype": "torch.bfloat16",
+                            "workload": {
+                                "status": "available",
+                                "operation": "gemm",
+                            },
+                            "kernels": {
+                                "pytorch_reference": {
+                                    "time_ms": 1.5,
+                                    "backend": {
+                                        "schema_version": 1,
+                                        "method": "torch.profiler",
+                                        "aten_ops": ["aten::matmul"],
+                                        "cuda_kernels": [],
+                                        "libraries": {
+                                            "cublas": {
+                                                "status": "unknown",
+                                                "detected": None,
+                                                "confidence": "none",
+                                                "evidence": [],
+                                            },
+                                            "cudnn": {
+                                                "status": "unknown",
+                                                "detected": None,
+                                                "confidence": "none",
+                                                "evidence": [],
+                                            },
+                                        },
+                                        "warnings": [],
+                                    },
+                                    "performance": None,
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, "ok", ""
+            if failure == "nonzero":
+                return 1, "", "permission denied"
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(command, timeout_s)
+            return 0, "ok", ""
+
+        bench = Benchmark(
+            logger=logging.getLogger("ncu-failure"),
+            artifacts_dir=tmp_path,
+            benchmark_lock=threading.Lock(),
+            worker_id=-1,
+            warmup=1,
+            repeat=1,
+        )
+        cfg = {"kind": "ssh", "hostname": "box", "workspace": ""}
+        with patch("utils.remote_config.load_remote_config", return_value=cfg), \
+             patch(
+                 "utils.remote_exec.run_command_with_artifacts",
+                 side_effect=fake_run_cmd,
+             ):
+            result = bench.benchmark_pytorch(problem, kernel_file=kernel)
+
+        assert calls == 2
+        assert result["time_ms"] == 1.5
+        assert result["backend"]["ncu"]["status"] == expected_status
+        assert result["backend"]["warnings"]

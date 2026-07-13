@@ -44,6 +44,7 @@ from timing import (
     load_kernel_function,
     load_problem_interface,
     prepare_inputs,
+    prepare_pytorch_model,
 )
 from typing import Any, Callable
 
@@ -98,8 +99,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kernel",
         type=Path,
-        required=True,
-        help="Path to kernel file (must define kernel_function)",
+        help="Path to kernel file (required outside --ncu-baseline-once)",
     )
     parser.add_argument(
         "--baseline",
@@ -109,7 +109,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--size", type=int, default=4096, help="Problem size N")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
         "--dtype",
         type=str,
@@ -118,10 +118,22 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--json", type=Path, help="Save results to JSON file")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--ncu-baseline-once",
+        action="store_true",
+        help="Run exactly one PyTorch baseline forward inside CUDA profiler markers",
+    )
+    parser.add_argument(
+        "--pytorch-config-json",
+        help="JSON PyTorch backend flags restored by --ncu-baseline-once",
+    )
 
     args = parser.parse_args()
+    if not args.ncu_baseline_once and args.kernel is None:
+        parser.error("--kernel is required unless --ncu-baseline-once is set")
     args.problem = args.problem.resolve()
-    args.kernel = args.kernel.resolve()
+    if args.kernel is not None:
+        args.kernel = args.kernel.resolve()
     return args
 
 
@@ -174,6 +186,56 @@ def _load_problem(
             print()
 
     return Model, inputs, init_inputs, baseline_model
+
+
+def _run_ncu_baseline_once(
+    problem_file: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    pytorch_config: dict[str, Any],
+    quiet: bool,
+) -> None:
+    """Execute one eager forward in a cudaProfilerStart/Stop capture range."""
+    if device.type != "cuda":
+        raise ValueError("--ncu-baseline-once requires --device cuda")
+    if device.index is not None:
+        torch.cuda.set_device(device)
+
+    model, inputs = prepare_pytorch_model(
+        problem_file=problem_file,
+        device=device,
+        dtype=dtype,
+    )
+    model.eval()
+
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    matmul_backend = getattr(cuda_backends, "matmul", None)
+    backend_flags = (
+        ("cudnn_enabled", cudnn_backend, "enabled"),
+        ("cudnn_benchmark", cudnn_backend, "benchmark"),
+        ("cudnn_allow_tf32", cudnn_backend, "allow_tf32"),
+        ("matmul_allow_tf32", matmul_backend, "allow_tf32"),
+    )
+    for key, target, attribute in backend_flags:
+        value = pytorch_config.get(key)
+        if target is not None and isinstance(value, bool):
+            setattr(target, attribute, value)
+
+    torch.cuda.synchronize()
+
+    runtime = torch.cuda.cudart()
+    torch.cuda.check_error(runtime.cudaProfilerStart())
+    try:
+        with torch.inference_mode():
+            output = model(*inputs)
+        torch.cuda.synchronize()
+    finally:
+        torch.cuda.check_error(runtime.cudaProfilerStop())
+
+    if not quiet:
+        shape = output.shape if hasattr(output, "shape") else type(output)
+        print(f"NCU baseline forward completed, output shape: {shape}")
 
 
 def _prepare_kernel(
@@ -244,6 +306,27 @@ def main():
         "bfloat16": torch.bfloat16,
     }[args.dtype]
 
+    if args.ncu_baseline_once:
+        try:
+            pytorch_config = (
+                json.loads(args.pytorch_config_json)
+                if args.pytorch_config_json
+                else {}
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid --pytorch-config-json: {exc}") from exc
+        if not isinstance(pytorch_config, dict):
+            raise ValueError("--pytorch-config-json must contain a JSON object")
+        _run_ncu_baseline_once(
+            args.problem,
+            device,
+            dtype,
+            pytorch_config,
+            args.quiet,
+        )
+        return
+
+    assert args.kernel is not None
     # Auto-detect dtype from kernel source (matches NCU wrapper's dtype inference)
     kernel_source = ""
     try:
@@ -278,7 +361,14 @@ def main():
     results: dict[str, Any] = {
         "problem": str(args.problem),
         "size": args.size,
-        "device": str(device),
+        "device": next(
+            (
+                str(inp.device)
+                for inp in inputs
+                if isinstance(inp, torch.Tensor) and inp.is_cuda
+            ),
+            str(device),
+        ),
         "dtype": str(dtype),
         "warmup": args.warmup,
         "repeat": args.repeat,

@@ -579,6 +579,11 @@ class OptimizationManager:
                 if isinstance(pytorch_benchmark_result, dict)
                 else None
             ),
+            "pytorch_baseline_backend": (
+                pytorch_benchmark_result.get("backend")
+                if isinstance(pytorch_benchmark_result, dict)
+                else None
+            ),
             "top_kernels": [
                 {
                     "kernel_code": p.kernel_code,

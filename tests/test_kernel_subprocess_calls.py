@@ -73,3 +73,57 @@ def test_internal_helper_calls_match_signatures():
                 )
                 checked += 1
     assert checked >= 3, f"expected >=3 helper call sites, found {checked}"
+
+
+def test_ncu_baseline_mode_runs_one_forward_before_normal_benchmark_path():
+    tree = ast.parse(_SRC.read_text())
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    helper = functions["_run_ncu_baseline_once"]
+    model_forwards = [
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "model"
+    ]
+    profiler_calls = [
+        node.func.attr
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"cudaProfilerStart", "cudaProfilerStop"}
+    ]
+    set_device_calls = [
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set_device"
+    ]
+
+    assert len(model_forwards) == 1
+    assert profiler_calls.count("cudaProfilerStart") == 1
+    assert profiler_calls.count("cudaProfilerStop") == 1
+    assert len(set_device_calls) == 1
+
+    main = functions["main"]
+    ncu_dispatch = next(
+        node
+        for node in main.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "ncu_baseline_once"
+    )
+    assert any(isinstance(node, ast.Return) for node in ncu_dispatch.body)
+    normal_load_line = min(
+        node.lineno
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_load_problem"
+    )
+    assert ncu_dispatch.lineno < normal_load_line
