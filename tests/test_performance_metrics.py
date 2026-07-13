@@ -54,6 +54,14 @@ def test_gemm_workload_formula():
     assert spec["details"] == {"M": 4096, "N": 4096, "K": 4096}
 
 
+def test_isolated_bf16_gemm_workload_formula():
+    spec = _load_workload_spec("examples/optimize_gemm_bf16/problem.py")
+
+    assert spec["flops"] == 2 * 4096**3
+    assert spec["minimum_io_elements"] == 3 * 4096**2
+    assert spec["details"] == {"M": 4096, "N": 4096, "K": 4096}
+
+
 def test_fused_conv_workload_formula():
     spec = _load_workload_spec("examples/optimize_conv/problem.py")
     output_elements = 128 * 128 * 126 * 126
