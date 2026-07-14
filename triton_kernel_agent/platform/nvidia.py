@@ -691,15 +691,17 @@ class NvidiaBottleneckAnalyzer(BottleneckAnalyzerBase):
 
 
 class NvidiaRAGPrescriber(RAGPrescriberBase):
-    """Wraps :class:`RAGPrescriber` (OpenAI-embedding RAG) with lazy construction."""
+    """Wraps :class:`RAGPrescriber` with lazy construction."""
 
     def __init__(
         self,
         logger: logging.Logger | None = None,
         database_path: Path | None = None,
+        rag_embedding: dict[str, Any] | None = None,
     ) -> None:
         self._logger = logger
         self._database_path = database_path
+        self._embedding_config = dict(rag_embedding or {})
         self._delegate: Any | None = None
 
     def _get_delegate(self) -> Any:
@@ -708,7 +710,10 @@ class NvidiaRAGPrescriber(RAGPrescriberBase):
                 RAGPrescriber,
             )
 
-            kwargs: dict[str, Any] = {"logger": self._logger}
+            kwargs: dict[str, Any] = {
+                "logger": self._logger,
+                "embedding_config": self._embedding_config,
+            }
             if self._database_path is not None:
                 kwargs["database_path"] = self._database_path
             self._delegate = RAGPrescriber(**kwargs)

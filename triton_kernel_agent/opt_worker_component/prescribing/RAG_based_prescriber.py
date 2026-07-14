@@ -33,26 +33,33 @@ Usage:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from kernel_perf_agent.kernel_opt.database.base import OptHierarchy, OptNode
+from triton_kernel_agent.opt_worker_component.prescribing.embedding_backend import (
+    EmbeddingBackend,
+    create_embedding_backend,
+)
 
 
 class RAGPrescriber:
     """
     Embedding-based retriever for optimization patterns.
 
-    Uses OpenAI embeddings to find the most similar optimization node
-    based on the optimization prompt, then traverses to leaf nodes
-    to collect code examples.
+    Uses a pluggable embedding backend to find the most similar optimization
+    node, then traverses to leaf nodes to collect code examples.
     """
 
     def __init__(
         self,
         database_path: Path | None = None,
         logger: logging.Logger | None = None,
+        embedding_backend: EmbeddingBackend | None = None,
+        embedding_config: Mapping[str, Any] | None = None,
     ):
         """
         Initialize the RAG prescriber.
@@ -61,10 +68,16 @@ class RAGPrescriber:
             database_path: Path to code_samples directory. Defaults to
                            kernel_perf_agent/kernel_opt/database/code_samples
             logger: Optional logger instance
+            embedding_backend: Optional pre-built backend for dependency injection
+            embedding_config: ``{backend, options}`` used when no backend is injected
         """
         self.logger = logger or logging.getLogger(__name__)
         self.opt_hierarchy: OptHierarchy | None = None
-        self._openai_client = None  # Lazy-loaded
+        self.embedding_backend = (
+            embedding_backend
+            if embedding_backend is not None
+            else create_embedding_backend(embedding_config)
+        )
         self._node_embeddings: dict[
             OptNode, list[float]
         ] = {}  # Precomputed L1/L2 embeddings
@@ -120,22 +133,9 @@ class RAGPrescriber:
             f"Precomputed embeddings for {len(self._node_embeddings)} L1/L2 nodes"
         )
 
-    def _get_openai_client(self):
-        """Lazy-load OpenAI client."""
-        if self._openai_client is None:
-            from openai import OpenAI
-
-            self._openai_client = OpenAI()
-        return self._openai_client
-
     def _embed_query(self, text: str) -> list[float]:
         """Get embedding for a text query."""
-        client = self._get_openai_client()
-        response = client.embeddings.create(
-            input=text,
-            model="text-embedding-3-large",  # text-embedding-3-small for lower cost
-        )
-        return response.data[0].embedding
+        return self.embedding_backend.embed(text)
 
     def _cosine_similarity(self, vec1, vec2) -> float:
         """Compute cosine similarity between two vectors."""

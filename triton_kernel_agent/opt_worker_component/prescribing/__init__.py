@@ -15,5 +15,15 @@
 """Prescribing module for kernel optimization."""
 
 from .bottleneck_analyzer import BottleneckAnalyzer
+from .embedding_backend import (
+    EmbeddingBackend,
+    embedding_backends,
+    create_embedding_backend,
+)
 
-__all__ = ["BottleneckAnalyzer"]
+__all__ = [
+    "BottleneckAnalyzer",
+    "EmbeddingBackend",
+    "create_embedding_backend",
+    "embedding_backends",
+]

@@ -92,6 +92,7 @@ class OptimizationWorker:
         prior_history: list[dict] | None = None,
         prior_reflexions: list[dict] | None = None,
         use_rag: bool = False,
+        rag_embedding: dict[str, Any] | None = None,
         # Platform components resolved by the manager registry ─────
         platform_components: dict[str, Any] | None = None,
         # Registry-driven platform config (string names) ───────────
@@ -121,6 +122,7 @@ class OptimizationWorker:
             target_platform: Target platform (cuda, rocm, etc.)
             roofline_config: Roofline configuration (uses defaults if None)
             use_rag: Whether to enable RAG-based prescriber for optimization hints
+            rag_embedding: Embedding backend configuration for the RAG prescriber
             platform_components: Dict of registry-resolved component instances
                 keyed by registry name (e.g. ``{"profiler": <instance>, ...}``).
                 Populated by ``OptimizationManager._resolve_platform()``.
@@ -145,6 +147,7 @@ class OptimizationWorker:
         self.benchmark_repeat = benchmark_repeat
         self.roofline_config = roofline_config or RooflineConfig()
         self.use_rag = use_rag
+        self.rag_embedding = dict(rag_embedding or {})
 
         # Platform components (registry-resolved, may be empty)
         self._platform = platform_components or {}
@@ -246,6 +249,7 @@ class OptimizationWorker:
             openai_model=self.openai_model,
             gpu_name=self.gpu_name,
             roofline_config=self.roofline_config,
+            rag_embedding=self.rag_embedding,
         )
         for k, v in resolved.items():
             if k not in self._platform:
@@ -345,7 +349,10 @@ class OptimizationWorker:
                     RAGPrescriber,
                 )
 
-                self.rag_prescriber = RAGPrescriber(logger=self.logger)
+                self.rag_prescriber = RAGPrescriber(
+                    logger=self.logger,
+                    embedding_config=self.rag_embedding,
+                )
                 self.logger.info("RAG prescriber initialized")
             except Exception as e:
                 self.logger.warning(f"RAG prescriber init failed: {e}")
