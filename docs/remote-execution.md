@@ -133,3 +133,92 @@ devspace-heartbeat stop
 It discovers running GPU devspaces via `cctl devspace list` and POSTs a periodic
 heartbeat (default every 300 s). Requires `cctl` installed and logged in. Not
 needed for a static on-prem SSH box.
+
+## Request and manage a devspace
+
+When the remote host is a Cybertron devspace, the whole lifecycle — provision,
+inspect, keep alive, and reclaim — is driven by the `cctl` CLI. Install it and
+log in first; every command below assumes an authenticated profile.
+
+```bash
+cctl login                 # browser sign-in, or: cctl login <token>
+cctl profile current       # confirm which credential profile is active
+```
+
+> Agent tip: `cctl` prints JSON whenever stdout is not a TTY, so pipe to `jq`
+> or add `-o json` explicitly in scripts. Use `-F name,status` to pull just the
+> fields you need, and `-q` to print only IDs.
+
+### 1. Find a pool and an image
+
+```bash
+cctl pool list --own                            # pools you can schedule on
+cctl image list --usage training --limit 20     # base images; prefer loopharness
+```
+
+Prefer a `loopharness` image — it ships `rsync` and `ncu` (Nsight Compute) out
+of the box, which the candidate verification and NCU profiling steps both need.
+
+### 2. Create the devspace
+
+The account-specific parameters (project / cluster / pool / image / billing) live
+in the gitignored `.env.local` — fill them in once, then source it:
+
+```bash
+set -a && source .env.local && set +a
+
+cctl devspace create \
+  --project "$CCTL_PROJECT" --cluster "$CCTL_CLUSTER" \
+  --resource-pool "$CCTL_RESOURCE_POOL" \
+  --image "$CCTL_IMAGE" \
+  --gpu 1 --gpu-model H100 --cpu 16 --memory 128 \
+  --priority PREEMPTABLE \
+  --billing-account-id "$CCTL_BILLING_ACCOUNT_ID"
+```
+
+Notes:
+
+- `--priority PREEMPTABLE` is required unless you hold *staff* permission on the
+  resource pool. The default `NORMAL` (and `HIGH`) is rejected for non-staff
+  members with `task.priority: NORMAL/HIGH requires resource pool staff permission`.
+- A devspace has no `--entry`; it is an interactive environment, not a batch job.
+- Duration is heartbeat-managed (forced to 0), so the box stays up only while it
+  receives heartbeats — see [Keeping a managed devspace alive](#keeping-a-managed-devspace-alive).
+- Add `--dry-run` to preview the request payload without submitting.
+- For repeatable specs use `-f task.json` instead of long flag lists.
+
+### 3. Inspect and connect
+
+```bash
+cctl devspace list --own --status Running        # find your devspace + its id
+cctl devspace get <id>                            # full detail (node name, ip, ports)
+cctl devspace get <id> -F name,status
+cctl devspace logs <id>                            # startup / runtime logs
+cctl devspace metrics <id>                         # GPU / power / temp / util
+```
+
+Use the node name from `get` to build the `~/.ssh/config` alias (proxy/cert/port)
+so that plain `ssh <hostname>` works — that alias is what `remote.toml`'s
+`hostname` points at (see [Configure](#configure) and the SSH setup in
+`HANDOFF.md §2.3`). If you serve a dashboard or notebook from the box, expose its
+port:
+
+```bash
+cctl devspace expose <id> --port 8086 --open       # enable + open in browser
+cctl devspace expose <id> --disable                # turn it back off
+```
+
+### 4. Snapshot, restore, and stop
+
+```bash
+cctl devspace stop <id> --snapshot-before-stop best-effort   # save state, then stop
+cctl devspace stop <id> -y                                     # stop immediately
+cctl devspace restore <id> -y                                 # new devspace from a snapshot
+```
+
+Snapshotting before a stop lets you rehydrate the same environment later with
+`restore`. After creating or restoring, update `remote.toml` (and your
+`~/.ssh/config` alias) to the new node name, and restart the heartbeat.
+
+> If `cctl` cannot see the devspace (token scope) the API-based heartbeat won't
+> work either; fall back to the direct-SSH heartbeat documented in `HANDOFF.md §3`.
