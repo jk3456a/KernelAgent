@@ -49,3 +49,17 @@ class LLMCenterProvider(OpenAICompatibleProvider):
         # reasoning_content and the final content. llm-center currently rejects
         # max_tokens above 128K even though the context window is larger.
         return 131_072
+
+    def _build_api_params(self, model_name, messages, **kwargs):
+        params = super()._build_api_params(model_name, messages, **kwargs)
+        # llm-center's passthrough kills any stream that stays chunk-silent for
+        # 120s, and the GLM thinking phase can exceed that on hard prompts
+        # before the first delta is forwarded. LLM_CENTER_GLM_THINKING=disabled
+        # skips the thinking phase (Zhipu extra_body param) so content chunks
+        # start flowing immediately.
+        if (
+            model_name.startswith("glm")
+            and os.environ.get("LLM_CENTER_GLM_THINKING", "").lower() == "disabled"
+        ):
+            params["extra_body"] = {"thinking": {"type": "disabled"}}
+        return params

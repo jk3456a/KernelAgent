@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -215,6 +217,43 @@ def test_agent2_strategy_can_be_overridden(tmp_path, monkeypatch):
     assert pipeline.run_agent2(run_dir) == 0
     strategy_index = captured["cmd"].index("--strategy") + 1
     assert captured["cmd"][strategy_index] == "greedy_glm"
+
+
+def test_module_defaults_glm_thinking_disabled(monkeypatch):
+    monkeypatch.delenv("LLM_CENTER_GLM_THINKING", raising=False)
+    importlib.reload(pipeline)
+    assert os.environ.get("LLM_CENTER_GLM_THINKING") == "disabled"
+
+
+def test_module_respects_existing_glm_thinking_setting(monkeypatch):
+    monkeypatch.setenv("LLM_CENTER_GLM_THINKING", "enabled")
+    importlib.reload(pipeline)
+    assert os.environ.get("LLM_CENTER_GLM_THINKING") == "enabled"
+
+
+def test_agent1_llm_error_consumes_attempt_and_retries(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "test.py").write_text("strict test", encoding="utf-8")
+    calls = {"generate": 0}
+
+    class FlakyAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate_kernel(self, **kwargs):
+            calls["generate"] += 1
+            if calls["generate"] == 1:
+                raise RuntimeError(
+                    "passthrough stream idle timeout after 120s waiting for next chunk"
+                )
+            return {"success": True, "kernel_code": "recovered kernel"}
+
+    monkeypatch.setattr(pipeline, "TritonKernelAgent", FlakyAgent)
+
+    assert pipeline.run_agent1(run_dir)
+    assert calls["generate"] == 2
+    assert (run_dir / "input.py").read_text(encoding="utf-8") == "recovered kernel"
 
 
 def test_binding_and_validation_end_to_end_cpu(monkeypatch):

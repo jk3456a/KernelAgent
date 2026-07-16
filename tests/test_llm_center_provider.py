@@ -46,12 +46,31 @@ class TestLLMCenterProvider:
         # GLM is not a gpt-5/o-series model, so it must get temperature + the
         # plain max_tokens param (not max_completion_tokens / reasoning_effort).
         monkeypatch.setenv("LLM_CENTER_API_KEY", "sk-test")
+        monkeypatch.delenv("LLM_CENTER_GLM_THINKING", raising=False)
         p = LLMCenterProvider()
         params = p._build_api_params("glm-5.2", [{"role": "user", "content": "hi"}])
         assert "temperature" in params
         assert "max_tokens" in params
         assert "max_completion_tokens" not in params
         assert "reasoning_effort" not in params
+        assert "extra_body" not in params
+
+    def test_glm_thinking_disabled_via_env(self, monkeypatch):
+        # llm-center's passthrough kills streams that stay chunk-silent >120s,
+        # and the GLM reasoning phase can exceed that on hard prompts. The env
+        # switch must disable the thinking phase via the Zhipu extra_body param.
+        monkeypatch.setenv("LLM_CENTER_API_KEY", "sk-test")
+        monkeypatch.setenv("LLM_CENTER_GLM_THINKING", "disabled")
+        p = LLMCenterProvider()
+        params = p._build_api_params("glm-5.2", [{"role": "user", "content": "hi"}])
+        assert params["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    def test_thinking_env_ignored_for_non_glm_models(self, monkeypatch):
+        monkeypatch.setenv("LLM_CENTER_API_KEY", "sk-test")
+        monkeypatch.setenv("LLM_CENTER_GLM_THINKING", "disabled")
+        p = LLMCenterProvider()
+        params = p._build_api_params("gpt-5", [{"role": "user", "content": "hi"}])
+        assert "extra_body" not in params
 
 
 class TestGLMModelRegistered:

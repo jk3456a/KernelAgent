@@ -26,6 +26,12 @@ AGENT2_MAX_ROUNDS = 10
 DEFAULT_AGENT2_STRATEGY = "greedy_glm_rag"
 AGENT2_STRATEGY_ENV = "MATMUL_GELU_SOFTMAX_AGENT2_STRATEGY"
 
+# llm-center's passthrough kills streams that stay chunk-silent >120s, and
+# GLM-5.2's thinking phase exceeds that on this fused problem (measured: the
+# BF16 GEMM prompt streams within ~60s, this one times out every attempt).
+# Disable the thinking phase for GLM calls unless the caller overrides it.
+os.environ.setdefault("LLM_CENTER_GLM_THINKING", "disabled")
+
 PROBLEM = (
     "Implement a fused Triton kernel for y = softmax(gelu(x @ W.T + b), dim=1), "
     "matching KernelBench level2 #99 (Matmul_GELU_Softmax). x is a (1024, 8192) "
@@ -73,11 +79,17 @@ def run_agent1(run_dir: Path) -> bool:
             log_dir=str(run_dir / "agent1_logs"),
             model_name=MODEL_NAME,
         )
-        result = agent.generate_kernel(
-            problem_description=PROBLEM,
-            test_code=test_code,
-            generate_default_test=False,
-        )
+        try:
+            result = agent.generate_kernel(
+                problem_description=PROBLEM,
+                test_code=test_code,
+                generate_default_test=False,
+            )
+        except Exception as exc:
+            # LLM/gateway failures (e.g. llm-center stream idle timeouts)
+            # consume one attempt instead of killing the whole pipeline.
+            print(f"[attempt {attempt}] error: {exc}", flush=True)
+            continue
         print(f"[attempt {attempt}] success={result.get('success')}", flush=True)
 
         if result.get("success") and result.get("kernel_code"):
