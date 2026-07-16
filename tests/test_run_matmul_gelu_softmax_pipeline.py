@@ -123,6 +123,18 @@ def test_strict_test_defers_kernel_imports_into_test_function():
     assert top_level_imports <= {"sys", "torch"}
 
 
+def test_strict_test_is_self_contained_without_problem_import():
+    # agent1's remote verification sandbox ships only the kernel and this
+    # test file — never problem.py — so the test must not import problem.
+    tree = ast.parse(_TEST_FILE.read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "problem" not in imported_modules
+
+
 def test_create_run_dir_copies_isolated_contract(tmp_path, monkeypatch):
     source_dir = tmp_path / "optimize_matmul_gelu_softmax"
     source_dir.mkdir()
@@ -265,18 +277,8 @@ def test_binding_and_validation_end_to_end_cpu(monkeypatch):
     test_module = _load_module(_TEST_FILE, "matmul_gelu_softmax_test_module")
     validate_output = test_module.validate_output
 
-    class TinyModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear = torch.nn.Linear(8, 8)
-
-        def forward(self, x):
-            x = self.linear(x)
-            x = torch.nn.functional.gelu(x)
-            return torch.nn.functional.softmax(x, dim=1)
-
     torch.manual_seed(0)
-    model = TinyModel().to(torch.bfloat16)
+    linear = torch.nn.Linear(8, 8).to(torch.bfloat16)
     x = torch.rand(4, 8, dtype=torch.bfloat16)
 
     seen = []
@@ -287,18 +289,21 @@ def test_binding_and_validation_end_to_end_cpu(monkeypatch):
         acc = torch.nn.functional.gelu(acc)
         return torch.nn.functional.softmax(acc, dim=1).to(torch.bfloat16)
 
-    invoke = timing.bind_kernel_function(kernel_function, [x], model)
+    invoke = timing.bind_kernel_function(kernel_function, [x], linear)
     kernel_output = invoke()
 
     # The binder must fill tensor slots as [*inputs, *model_tensors] with the
-    # nn.Linear weight extracted before its bias.
+    # nn.Linear weight extracted before its bias (same bare-Linear binding
+    # that test.py's self-contained test_kernel relies on).
     assert len(seen) == 3
     assert seen[0].shape == (4, 8) and torch.equal(seen[0], x)
-    assert seen[1].shape == (8, 8) and torch.equal(seen[1], model.linear.weight)
-    assert seen[2].shape == (8,) and torch.equal(seen[2], model.linear.bias)
+    assert seen[1].shape == (8, 8) and torch.equal(seen[1], linear.weight)
+    assert seen[2].shape == (8,) and torch.equal(seen[2], linear.bias)
 
     with torch.no_grad():
-        ref_output = model(x)
+        ref_output = torch.nn.functional.softmax(
+            torch.nn.functional.gelu(linear(x)), dim=1
+        )
 
     assert validate_output(ref_output, kernel_output, expected_shape=(4, 8))
     assert not validate_output(ref_output, kernel_output.float(), expected_shape=(4, 8))

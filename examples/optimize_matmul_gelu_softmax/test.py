@@ -14,8 +14,11 @@
 
 """Strict correctness test for the fused BF16 Matmul + GELU + Softmax.
 
-The kernel/problem/timing imports stay inside ``test_kernel()`` so this module
-can be imported on a CPU-only machine to reuse ``validate_output``.
+Self-contained on purpose: agent1's remote verification sandbox ships only the
+kernel and this file (problem.py is not pushed), so the Linear->GELU->softmax
+reference is built inline. The kernel/timing imports stay inside
+``test_kernel()`` so this module is importable on a CPU-only machine to reuse
+``validate_output``.
 """
 
 import sys
@@ -71,19 +74,21 @@ def validate_output(
 
 def test_kernel():
     from kernel import kernel_function
-    from problem import Model, get_init_inputs, get_inputs
     from timing import bind_kernel_function
 
     device = "cuda"
     dtype = torch.bfloat16
 
-    model = Model(*get_init_inputs()).to(device).to(dtype)
-    inputs = [x.to(device).to(dtype) for x in get_inputs()]
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(in_features, out_features).to(device).to(dtype)
+    x = torch.rand(batch_size, in_features, device=device, dtype=dtype)
 
     with torch.no_grad():
-        ref_output = model(*inputs)
+        ref_output = torch.nn.functional.softmax(
+            torch.nn.functional.gelu(linear(x)), dim=1
+        )
 
-    invoke = bind_kernel_function(kernel_function, inputs, model)
+    invoke = bind_kernel_function(kernel_function, [x], linear)
     kernel_output = invoke()
     return validate_output(ref_output, kernel_output)
 
