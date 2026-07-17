@@ -1,0 +1,112 @@
+{
+  "problem": "/root/.kernelagent_remote/remote_bench_pytorch/problem.py",
+  "size": 4096,
+  "device": "cuda:0",
+  "dtype": "torch.bfloat16",
+  "warmup": 25,
+  "repeat": 100,
+  "workload": {
+    "status": "available",
+    "operation": "matmul_gelu_softmax",
+    "dtype": "bfloat16",
+    "flops": 137438953472,
+    "epilogue_flops": 58720256,
+    "minimum_io_elements": 83894272,
+    "minimum_io_bytes": 167788544,
+    "arithmetic_intensity_flops_per_byte": 819.1200078117371,
+    "flop_convention": "2_per_fma",
+    "flop_scope": "primary_tensor_math",
+    "io_scope": "semantic_minimum",
+    "warnings": [],
+    "details": {
+      "batch": 1024,
+      "in_features": 8192,
+      "out_features": 8192,
+      "softmax_dim": 1
+    }
+  },
+  "kernels": {
+    "pytorch_reference": {
+      "time_ms": 0.222961044019979,
+      "speedup": 1.0,
+      "backend": {
+        "aten_ops": [
+          "aten::linear",
+          "aten::t",
+          "aten::transpose",
+          "aten::as_strided",
+          "aten::addmm",
+          "aten::gelu",
+          "aten::softmax",
+          "aten::_softmax"
+        ],
+        "cuda_kernels": [
+          "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_bias_TNT",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#2}::operator()() const::{lambda()#4}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul> >(int, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#2}::operator()() const::{lambda()#4}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "void at::native::(anonymous namespace)::cunn_SoftMaxForwardReg<c10::BFloat16, float, c10::BFloat16, at::native::(anonymous namespace)::SoftMaxForwardEpilogue, long, 8>(c10::BFloat16*, c10::BFloat16 const*, long)"
+        ],
+        "libraries": {
+          "cublas": {
+            "status": "unknown",
+            "detected": null,
+            "confidence": "none",
+            "evidence": []
+          },
+          "cudnn": {
+            "status": "not_detected",
+            "detected": false,
+            "confidence": "medium",
+            "evidence": []
+          }
+        },
+        "schema_version": 1,
+        "method": "torch.profiler",
+        "torch_version": "2.8.0+cu128",
+        "cuda_device": "NVIDIA H100 80GB HBM3",
+        "pytorch_config": {
+          "cudnn_enabled": true,
+          "cudnn_benchmark": false,
+          "cudnn_allow_tf32": true,
+          "matmul_allow_tf32": false,
+          "usage_evidence": false
+        },
+        "warnings": []
+      },
+      "performance": {
+        "status": "throughput_only",
+        "time_ms": 0.222961044019979,
+        "achieved_tflops": 616.425860742222,
+        "mfu_pct": null,
+        "dense_peak_tflops": null,
+        "roofline_attainable_tflops": null,
+        "roofline_utilization_pct": null,
+        "limiting_resource": null,
+        "math_mode": null,
+        "peak_source": null,
+        "gpu_name": null,
+        "warnings": [],
+        "math_mode_hint": null
+      }
+    },
+    "initial_kernel": {
+      "time_ms": 4.064457356929779,
+      "path": "/root/.kernelagent_remote/remote_bench_pytorch/initial_kernel.py",
+      "performance": {
+        "status": "throughput_only",
+        "time_ms": 4.064457356929779,
+        "achieved_tflops": 33.81483465133929,
+        "mfu_pct": null,
+        "dense_peak_tflops": null,
+        "roofline_attainable_tflops": null,
+        "roofline_utilization_pct": null,
+        "limiting_resource": null,
+        "math_mode": null,
+        "peak_source": null,
+        "gpu_name": null,
+        "warnings": [],
+        "math_mode_hint": null
+      },
+      "speedup": 0.054856288168416145
+    }
+  }
+}

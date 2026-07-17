@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "problem": "/Users/apple/.warp/worktrees/lizhen-KernelAgent/centipede-tierra/examples/optimize_matmul_gelu_softmax/runs/matmul_gelu_softmax_20260716_212643/problem.py",
+  "benchmarks": {
+    "initial_kernel": {
+      "time_ms": 4.063717551853346,
+      "speedup": 1.0,
+      "workload": {
+        "status": "available",
+        "operation": "matmul_gelu_softmax",
+        "dtype": "bfloat16",
+        "flops": 137438953472,
+        "epilogue_flops": 58720256,
+        "minimum_io_elements": 83894272,
+        "minimum_io_bytes": 167788544,
+        "arithmetic_intensity_flops_per_byte": 819.1200078117371,
+        "flop_convention": "2_per_fma",
+        "flop_scope": "primary_tensor_math",
+        "io_scope": "semantic_minimum",
+        "warnings": [],
+        "details": {
+          "batch": 1024,
+          "in_features": 8192,
+          "out_features": 8192,
+          "softmax_dim": 1
+        }
+      },
+      "performance": {
+        "status": "available",
+        "time_ms": 4.063717551853346,
+        "achieved_tflops": 33.8209906860574,
+        "mfu_pct": 3.417987941996705,
+        "dense_peak_tflops": 989.5,
+        "roofline_attainable_tflops": 989.5,
+        "roofline_utilization_pct": 3.417987941996705,
+        "limiting_resource": "compute",
+        "math_mode": "bf16_tensor_core",
+        "peak_source": "gpu_specs.peak_bf16_tflops",
+        "gpu_name": "NVIDIA H100 SXM 80GB",
+        "warnings": [],
+        "math_mode_hint": null
+      }
+    },
+    "pytorch_reference": {
+      "time_ms": 0.222961044019979,
+      "speedup": null,
+      "workload": {
+        "status": "available",
+        "operation": "matmul_gelu_softmax",
+        "dtype": "bfloat16",
+        "flops": 137438953472,
+        "epilogue_flops": 58720256,
+        "minimum_io_elements": 83894272,
+        "minimum_io_bytes": 167788544,
+        "arithmetic_intensity_flops_per_byte": 819.1200078117371,
+        "flop_convention": "2_per_fma",
+        "flop_scope": "primary_tensor_math",
+        "io_scope": "semantic_minimum",
+        "warnings": [],
+        "details": {
+          "batch": 1024,
+          "in_features": 8192,
+          "out_features": 8192,
+          "softmax_dim": 1
+        }
+      },
+      "performance": {
+        "status": "available",
+        "time_ms": 0.222961044019979,
+        "achieved_tflops": 616.425860742222,
+        "mfu_pct": 62.29670143933521,
+        "dense_peak_tflops": 989.5,
+        "roofline_attainable_tflops": 989.5,
+        "roofline_utilization_pct": 62.29670143933521,
+        "limiting_resource": "compute",
+        "math_mode": "bf16_tensor_core",
+        "peak_source": "gpu_specs.peak_bf16_tflops",
+        "gpu_name": "NVIDIA H100 SXM 80GB",
+        "warnings": [],
+        "math_mode_hint": null
+      }
+    }
+  }
+}

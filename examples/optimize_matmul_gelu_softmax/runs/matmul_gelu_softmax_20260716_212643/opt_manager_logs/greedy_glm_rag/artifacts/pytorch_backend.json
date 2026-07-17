@@ -1,0 +1,77 @@
+{
+  "problem": "/Users/apple/.warp/worktrees/lizhen-KernelAgent/centipede-tierra/examples/optimize_matmul_gelu_softmax/runs/matmul_gelu_softmax_20260716_212643/problem.py",
+  "aten_ops": [
+    "aten::linear",
+    "aten::t",
+    "aten::transpose",
+    "aten::as_strided",
+    "aten::addmm",
+    "aten::gelu",
+    "aten::softmax",
+    "aten::_softmax"
+  ],
+  "cuda_kernels": [
+    "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_bias_TNT",
+    "void at::native::vectorized_elementwise_kernel<8, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#2}::operator()() const::{lambda()#4}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul> >(int, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#2}::operator()() const::{lambda()#4}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+    "void at::native::(anonymous namespace)::cunn_SoftMaxForwardReg<c10::BFloat16, float, c10::BFloat16, at::native::(anonymous namespace)::SoftMaxForwardEpilogue, long, 8>(c10::BFloat16*, c10::BFloat16 const*, long)"
+  ],
+  "libraries": {
+    "cublas": {
+      "status": "unknown",
+      "detected": null,
+      "confidence": "none",
+      "evidence": [],
+      "sources": [
+        "torch.profiler",
+        "ncu"
+      ],
+      "conflict": false
+    },
+    "cudnn": {
+      "status": "not_detected",
+      "detected": false,
+      "confidence": "medium",
+      "evidence": [],
+      "sources": [
+        "torch.profiler"
+      ],
+      "conflict": false
+    }
+  },
+  "schema_version": 2,
+  "method": "torch.profiler",
+  "torch_version": "2.8.0+cu128",
+  "cuda_device": "NVIDIA H100 80GB HBM3",
+  "pytorch_config": {
+    "cudnn_enabled": true,
+    "cudnn_benchmark": false,
+    "cudnn_allow_tf32": true,
+    "matmul_allow_tf32": false,
+    "usage_evidence": false
+  },
+  "warnings": [],
+  "methods": [
+    "torch.profiler",
+    "ncu"
+  ],
+  "ncu": {
+    "status": "succeeded",
+    "target_libraries": [
+      "cublas"
+    ],
+    "cuda_kernels": [
+      "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_bias_TNT",
+      "void at::vectorized_elementwise_kernel<8, at::GeluCUDAKernelImpl(at::TensorIteratorBase &, at::GeluType)::[lambda() (instance 2)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, 2>>(int, T2, T3)",
+      "void at::<unnamed>::cunn_SoftMaxForwardReg<c10::BFloat16, float, c10::BFloat16, at::<unnamed>::SoftMaxForwardEpilogue, long, 8>(T3 *, const T1 *, T5)"
+    ],
+    "libraries": {
+      "cublas": {
+        "status": "unknown",
+        "detected": null,
+        "confidence": "none",
+        "evidence": []
+      }
+    },
+    "warnings": []
+  }
+}
