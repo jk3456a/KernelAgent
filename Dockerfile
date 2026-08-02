@@ -101,8 +101,11 @@ ENV PATH="/root/venv-ka/bin:${PATH}"
 # activate is per-shell -- it must run in this RUN, an earlier one would not
 # survive into it.
 COPY requirements-gpu.txt /tmp/requirements-gpu.txt
+# unset PIP_CONSTRAINT: the NGC base image pins its own torch via this env var;
+# inside the venv we want our own pinned torch, not the NGC one.
 RUN set -Eeuo pipefail; \
     source /root/venv-ka/bin/activate; \
+    unset PIP_CONSTRAINT; \
     pip install --no-cache-dir \
         -i https://mirrors.aliyun.com/pypi/simple \
         -r /tmp/requirements-gpu.txt
