@@ -81,6 +81,14 @@ RUN python3 -m venv /root/venv-ka
 # Put the venv first on PATH so a bare `python3` / `pip` resolves into it.
 ENV PATH="/root/venv-ka/bin:${PATH}"
 
+# Clear the NGC base image's PIP_CONSTRAINT (/etc/pip/constraint.txt), which
+# pins the NGC torch (2.7.0a0+nv25.4). Left set, pip honors it inside the
+# venv too -- the torch==2.13.0 pin either conflicts or installs against a
+# constraint that disagrees, and the import check then fails. ENV, not a
+# per-shell `unset`, so it covers EVERY subsequent RUN (pip install AND the
+# import verification), not just the one shell that sourced activate.
+ENV PIP_CONSTRAINT=
+
 # pip through the mirrors.aliyun.com PyPI mirror. requirements-gpu.txt
 # carries no index directives of its own (option A), so the CLI flag is the
 # single source of the index here.
@@ -101,22 +109,8 @@ ENV PATH="/root/venv-ka/bin:${PATH}"
 # activate is per-shell -- it must run in this RUN, an earlier one would not
 # survive into it.
 COPY requirements-gpu.txt /tmp/requirements-gpu.txt
-# unset PIP_CONSTRAINT: the NGC base image pins its own torch via this env var;
-# inside the venv we want our own pinned torch, not the NGC one.
-#
-# DEBUG block (temporary): print what the venv actually sees before pip runs,
-# so the ACR build log shows whether NGC torch leaks into the venv and via
-# which mechanism (PIP_CONSTRAINT / PYTHONPATH / system-site-packages / PATH).
-# Remove once the torch conflict is resolved and stays resolved.
 RUN set -Eeuo pipefail; \
-    echo "=== DEBUG: PATH ==="; echo "$PATH"; \
-    echo "=== DEBUG: which python3 / pip ==="; command -v python3; command -v pip; \
-    echo "=== DEBUG: pip-related env ==="; env | grep -iE 'PIP|CONSTRAINT|PYTHONPATH|VIRTUAL_ENV' || true; \
-    echo "=== DEBUG: venv sys.path ==="; python3 -c "import sys; [print(p) for p in sys.path]"; \
-    echo "=== DEBUG: can venv see torch? ==="; python3 -c "import torch; print('torch', torch.__version__, torch.__file__)" 2>&1 || echo "no torch visible in venv"; \
-    echo "=== DEBUG: end ==="; \
     source /root/venv-ka/bin/activate; \
-    unset PIP_CONSTRAINT; \
     pip install --no-cache-dir \
         -i https://mirrors.aliyun.com/pypi/simple \
         -r /tmp/requirements-gpu.txt

@@ -176,3 +176,16 @@ def test_dockerfile_activates_venv_before_pip_install(dockerfile_text: str):
         "Dockerfile must `source /root/venv-ka/bin/activate` so the venv is "
         "explicitly active for the pip install, not just on PATH."
     )
+
+
+def test_dockerfile_clears_pip_constraint(dockerfile_text: str):
+    # The nvidia-pytorch base image sets PIP_CONSTRAINT=/etc/pip/constraint.txt,
+    # which pins the NGC torch (2.7.0a0+nv25.4). Left in place, pip honors that
+    # constraint inside the venv and the torch==2.13.0 pin either conflicts or
+    # silently installs nothing usable. A per-shell `unset` only covers one RUN
+    # and races with activate; ENV clears it for every subsequent layer
+    # including the pip install and the import check.
+    assert "ENV PIP_CONSTRAINT=" in dockerfile_text, (
+        "Dockerfile must clear PIP_CONSTRAINT via ENV so the NGC constraint "
+        "file stops pinning torch across every RUN, not just the pip install."
+    )
