@@ -100,6 +100,29 @@ def test_dockerfile_uses_aliyun_apt_mirror(dockerfile_text: str):
     )
 
 
+def test_dockerfile_apt_mirror_is_http(dockerfile_text: str):
+    # ACR's build gateway MITMs https://mirrors.cloud.aliyuncs.com with a
+    # self-signed cert (CN mismatch, IP 192.168.222.191), so apt's CA check
+    # fails. The apt source MUST be http, not https, to sidestep that.
+    assert "http://mirrors.cloud.aliyuncs.com/ubuntu/" in dockerfile_text, (
+        "Dockerfile apt mirror must use http (not https) -- the ACR build "
+        "gateway's TLS interception breaks https apt fetches."
+    )
+    assert "https://mirrors.cloud.aliyuncs.com/ubuntu/" not in dockerfile_text, (
+        "Dockerfile apt mirror must NOT use https -- ACR gateway MITM breaks it."
+    )
+
+
+def test_dockerfile_apt_mirror_covers_security_host(dockerfile_text: str):
+    # The sed must rewrite security.ubuntu.com too, not just archive. -- the
+    # noble-security suite ships on security.ubuntu.com and an unmatched host
+    # leaves apt fetching from the public Ubuntu mirror over the ACR egress.
+    assert "security.ubuntu.com" in dockerfile_text, (
+        "Dockerfile apt mirror sed must also cover security.ubuntu.com, the "
+        "host for the noble-security suite."
+    )
+
+
 def test_dockerfile_uses_aliyun_pip_mirror(dockerfile_text: str):
     assert "mirrors.cloud.aliyuncs.com/pypi/simple" in dockerfile_text, (
         "Dockerfile must point pip at the Aliyun intranet PyPI mirror; the "

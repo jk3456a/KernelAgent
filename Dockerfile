@@ -30,26 +30,39 @@ ARG DEBIAN_FRONTEND=noninteractive
 # Back up the original, then rewrite it to the Aliyun intranet mirror. Done
 # before any apt-get so the install itself pulls from the mirror.
 #
-# One sed covers both http and https, archive. and security., so it survives
-# whichever scheme the base image wrote. The deb822 file pairs `URIs:` with
-# `Signed-By:` lines we must leave intact, so we swap only the host prefix
-# (archive.ubuntu.com / security.ubuntu.com -> mirrors.cloud.aliyuncs.com)
-# rather than overwrite the whole file. A legacy sources.list fallback covers a
-# base that still uses the old format.
+# http, NOT https: ACR's build gateway MITMs https://mirrors.cloud.aliyuncs.com
+# with a self-signed certificate (CN mismatch, seen at IP 192.168.222.191), so
+# apt's CA check rejects every https suite with "The certificate is NOT
+# trusted." The Aliyun intranet mirror serves plain http too, and on the ACR
+# internal network that is the path that works.
+#
+# Two hosts, both rewritten: archive.ubuntu.com carries noble / noble-updates
+# / noble-backports, security.ubuntu.com carries noble-security. The previous
+# sed matched only `archive.ubuntu.com` (and a phantom `security.archive...`),
+# so noble-security kept hitting the public Ubuntu mirror -- fixed by matching
+# each host explicitly. We swap only the host prefix, leaving the deb822
+# `Signed-By:` lines intact; a legacy sources.list fallback covers a base that
+# still uses the old format.
 RUN set -Eeuo pipefail; \
     src=/etc/apt/sources.list.d/ubuntu.sources; \
     if [ -f "$src" ]; then \
         cp "$src" "${src}.bak"; \
-        sed -i 's|https\?://\(security\.\)\?archive\.ubuntu\.com/ubuntu/|https://mirrors.cloud.aliyuncs.com/ubuntu/|g' "$src"; \
+        sed -i \
+            -e 's|https\?://archive\.ubuntu\.com/ubuntu/|http://mirrors.cloud.aliyuncs.com/ubuntu/|g' \
+            -e 's|https\?://security\.ubuntu\.com/ubuntu/|http://mirrors.cloud.aliyuncs.com/ubuntu/|g' \
+            "$src"; \
     else \
-        sed -i 's|https\?://archive\.ubuntu\.com/ubuntu/|https://mirrors.cloud.aliyuncs.com/ubuntu/|g' /etc/apt/sources.list; \
-        sed -i 's|https\?://security\.ubuntu\.com/ubuntu/|https://mirrors.cloud.aliyuncs.com/ubuntu/|g' /etc/apt/sources.list; \
+        sed -i \
+            -e 's|https\?://archive\.ubuntu\.com/ubuntu/|http://mirrors.cloud.aliyuncs.com/ubuntu/|g' \
+            -e 's|https\?://security\.ubuntu\.com/ubuntu/|http://mirrors.cloud.aliyuncs.com/ubuntu/|g' \
+            /etc/apt/sources.list; \
     fi
 
 # rsync + tmux are the requested system tools; python3-venv backs `python3 -m
 # venv` (the base image's python3 alone may ship without ensurepip's venv
 # extras); python3-dev covers any future sdist in requirements-gpu.txt;
-# ca-certificates is needed for the https Aliyun mirror.
+# ca-certificates stays for the https pip mirror (apt itself runs over http
+# to the Aliyun mirror, see the note above).
 RUN set -Eeuo pipefail; \
     apt-get update && apt-get install -y --no-install-recommends \
         rsync \
