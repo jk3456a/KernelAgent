@@ -4,15 +4,16 @@
 # bakes requirements-gpu.txt in.
 #
 # Option A (per the design that picked it): index configuration lives HERE,
-# not in requirements-gpu.txt. Both apt and pip go through the Aliyun intranet
-# mirror (mirrors.cloud.aliyuncs.com) so an ACR build stays on-network. The
-# Tsinghua mirrors were tried first and return 403 from ACR build nodes --
-# cloud egress IPs are filtered by the university mirror. torch==2.13.0
-# therefore resolves from the Aliyun PyPI mirror (generic / CUDA 13 runtime
-# wheel) rather than a cu126 channel -- acceptable because the base image
-# ships a CUDA runtime matched to its torch, and the host driver is assumed
-# to support it. requirements-gpu.txt pins the versions; see that file's
-# header for the trade and the rollback path.
+# not in requirements-gpu.txt. apt goes through the Aliyun intranet mirror
+# (mirrors.cloud.aliyuncs.com, http) and pip through mirrors.aliyun.com
+# (https) -- the two are different hosts on purpose: apt's
+# mirrors.cloud.aliyuncs.com works over http on the ACR internal network,
+# but its TLS cert does not cover that hostname so pip (which wants https)
+# must use mirrors.aliyun.com instead. torch==2.13.0 resolves from that PyPI
+# mirror (generic / CUDA 13 runtime wheel) rather than a cu126 channel --
+# acceptable because the base image ships a CUDA runtime matched to its
+# torch, and the host driver is assumed to support it. requirements-gpu.txt
+# pins the versions; see that file's header for the trade and rollback path.
 #
 #   docker build -t kernelagent-gpu-venv .
 #   docker run --rm -it --gpus all --cap-add=SYS_ADMIN \
@@ -80,23 +81,30 @@ RUN python3 -m venv /root/venv-ka
 # Put the venv first on PATH so a bare `python3` / `pip` resolves into it.
 ENV PATH="/root/venv-ka/bin:${PATH}"
 
-# pip through the Aliyun intranet PyPI mirror. requirements-gpu.txt carries
-# no index directives of its own (option A), so the CLI flag is the single
-# source of the index here.
+# pip through the mirrors.aliyun.com PyPI mirror. requirements-gpu.txt
+# carries no index directives of its own (option A), so the CLI flag is the
+# single source of the index here.
+#
+# mirrors.aliyun.com, NOT mirrors.cloud.aliyuncs.com: the latter serves a TLS
+# certificate whose SAN covers only mirrors-ssl.aliyuncs.com and
+# mirrors.aliyun.com, so pip's hostname check rejects every request with
+# "hostname 'mirrors.cloud.aliyuncs.com' doesn't match" and torch never
+# downloads -- which then surfaces as a bogus ResolutionImpossible against
+# the base image's preinstalled NGC torch (pip falls back to the local
+# 2.7.0a0+nv25.4 when the remote fetch fails). mirrors.aliyun.com is in the
+# cert's SAN and serves the same PyPI mirror.
 #
 # `source activate` in the SAME RUN as pip, deliberately, not just ENV PATH:
 # the nvidia-pytorch base image preinstalls an NGC torch that pip's resolver
-# otherwise picks up as an installed constraint (torch==2.7.0a0+nv25.4),
-# which then conflicts with the torch==2.13.0 pin and aborts with
-# ResolutionImpossible. Activating the venv gives pip a clean interpreter
-# whose site-packages do not see the NGC system torch, so the pin resolves.
-# The activate is per-shell -- it must run in this RUN, an earlier one would
-# not survive into it.
+# could otherwise pick up as an installed constraint; activating the venv
+# gives pip a clean interpreter whose site-packages do not see it. The
+# activate is per-shell -- it must run in this RUN, an earlier one would not
+# survive into it.
 COPY requirements-gpu.txt /tmp/requirements-gpu.txt
 RUN set -Eeuo pipefail; \
     source /root/venv-ka/bin/activate; \
     pip install --no-cache-dir \
-        -i https://mirrors.cloud.aliyuncs.com/pypi/simple \
+        -i https://mirrors.aliyun.com/pypi/simple \
         -r /tmp/requirements-gpu.txt
 
 # Fail the build, not the first run, if the venv did not actually take. A bare

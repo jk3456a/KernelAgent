@@ -124,9 +124,19 @@ def test_dockerfile_apt_mirror_covers_security_host(dockerfile_text: str):
 
 
 def test_dockerfile_uses_aliyun_pip_mirror(dockerfile_text: str):
-    assert "mirrors.cloud.aliyuncs.com/pypi/simple" in dockerfile_text, (
-        "Dockerfile must point pip at the Aliyun intranet PyPI mirror; the "
-        "Tsinghua PyPI mirror is 403 from ACR build nodes too."
+    assert "mirrors.aliyun.com/pypi/simple" in dockerfile_text, (
+        "Dockerfile must point pip at the mirrors.aliyun.com PyPI mirror; "
+        "mirrors.cloud.aliyuncs.com's TLS cert SAN does not cover that host."
+    )
+
+
+def test_dockerfile_pip_mirror_not_cloud_host(dockerfile_text: str):
+    # mirrors.cloud.aliyuncs.com serves a cert whose SAN covers only
+    # mirrors-ssl.aliyuncs.com and mirrors.aliyun.com -- pip's hostname check
+    # rejects it. The pip -i URL must NOT reference mirrors.cloud.aliyuncs.com.
+    assert "mirrors.cloud.aliyuncs.com/pypi" not in dockerfile_text, (
+        "Dockerfile pip mirror must not be mirrors.cloud.aliyuncs.com -- its "
+        "cert does not cover that hostname; use mirrors.aliyun.com instead."
     )
 
 
