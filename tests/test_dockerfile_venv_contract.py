@@ -93,15 +93,17 @@ def test_dockerfile_installs_required_apt_packages(dockerfile_text: str):
         )
 
 
-def test_dockerfile_uses_tsinghua_apt_mirror(dockerfile_text: str):
-    assert "mirrors.tuna.tsinghua.edu.cn" in dockerfile_text, (
-        "Dockerfile must replace the apt sources with the Tsinghua mirror."
+def test_dockerfile_uses_aliyun_apt_mirror(dockerfile_text: str):
+    assert "mirrors.cloud.aliyuncs.com" in dockerfile_text, (
+        "Dockerfile must replace the apt sources with the Aliyun intranet "
+        "mirror -- Tsinghua returns 403 from ACR build nodes."
     )
 
 
-def test_dockerfile_uses_tsinghua_pip_mirror(dockerfile_text: str):
-    assert "pypi.tuna.tsinghua.edu.cn" in dockerfile_text, (
-        "Dockerfile must point pip at the Tsinghua PyPI mirror."
+def test_dockerfile_uses_aliyun_pip_mirror(dockerfile_text: str):
+    assert "mirrors.cloud.aliyuncs.com/pypi/simple" in dockerfile_text, (
+        "Dockerfile must point pip at the Aliyun intranet PyPI mirror; the "
+        "Tsinghua PyPI mirror is 403 from ACR build nodes too."
     )
 
 
