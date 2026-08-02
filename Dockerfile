@@ -103,7 +103,18 @@ ENV PATH="/root/venv-ka/bin:${PATH}"
 COPY requirements-gpu.txt /tmp/requirements-gpu.txt
 # unset PIP_CONSTRAINT: the NGC base image pins its own torch via this env var;
 # inside the venv we want our own pinned torch, not the NGC one.
+#
+# DEBUG block (temporary): print what the venv actually sees before pip runs,
+# so the ACR build log shows whether NGC torch leaks into the venv and via
+# which mechanism (PIP_CONSTRAINT / PYTHONPATH / system-site-packages / PATH).
+# Remove once the torch conflict is resolved and stays resolved.
 RUN set -Eeuo pipefail; \
+    echo "=== DEBUG: PATH ==="; echo "$PATH"; \
+    echo "=== DEBUG: which python3 / pip ==="; command -v python3; command -v pip; \
+    echo "=== DEBUG: pip-related env ==="; env | grep -iE 'PIP|CONSTRAINT|PYTHONPATH|VIRTUAL_ENV' || true; \
+    echo "=== DEBUG: venv sys.path ==="; python3 -c "import sys; [print(p) for p in sys.path]"; \
+    echo "=== DEBUG: can venv see torch? ==="; python3 -c "import torch; print('torch', torch.__version__, torch.__file__)" 2>&1 || echo "no torch visible in venv"; \
+    echo "=== DEBUG: end ==="; \
     source /root/venv-ka/bin/activate; \
     unset PIP_CONSTRAINT; \
     pip install --no-cache-dir \
