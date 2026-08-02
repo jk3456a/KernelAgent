@@ -83,8 +83,19 @@ ENV PATH="/root/venv-ka/bin:${PATH}"
 # pip through the Aliyun intranet PyPI mirror. requirements-gpu.txt carries
 # no index directives of its own (option A), so the CLI flag is the single
 # source of the index here.
+#
+# `source activate` in the SAME RUN as pip, deliberately, not just ENV PATH:
+# the nvidia-pytorch base image preinstalls an NGC torch that pip's resolver
+# otherwise picks up as an installed constraint (torch==2.7.0a0+nv25.4),
+# which then conflicts with the torch==2.13.0 pin and aborts with
+# ResolutionImpossible. Activating the venv gives pip a clean interpreter
+# whose site-packages do not see the NGC system torch, so the pin resolves.
+# The activate is per-shell -- it must run in this RUN, an earlier one would
+# not survive into it.
 COPY requirements-gpu.txt /tmp/requirements-gpu.txt
-RUN pip install --no-cache-dir \
+RUN set -Eeuo pipefail; \
+    source /root/venv-ka/bin/activate; \
+    pip install --no-cache-dir \
         -i https://mirrors.cloud.aliyuncs.com/pypi/simple \
         -r /tmp/requirements-gpu.txt
 

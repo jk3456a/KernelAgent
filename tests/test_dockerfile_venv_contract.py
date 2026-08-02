@@ -153,3 +153,16 @@ def test_dockerfile_pip_installs_requirements(dockerfile_text: str):
     assert "requirements-gpu.txt" in dockerfile_text and "pip install" in dockerfile_text, (
         "Dockerfile must pip install -r requirements-gpu.txt into the venv."
     )
+
+
+def test_dockerfile_activates_venv_before_pip_install(dockerfile_text: str):
+    # The pip install RUN must `source` the venv activation script before
+    # calling pip, rather than relying on ENV PATH alone. Activation also
+    # unsets PYTHONPATH-injected system torch from the resolver's view, which
+    # ENV PATH does not. The source line must appear in the same RUN as the
+    # pip install (activation is per-shell, so it cannot live in an earlier
+    # RUN and survive).
+    assert "source /root/venv-ka/bin/activate" in dockerfile_text, (
+        "Dockerfile must `source /root/venv-ka/bin/activate` so the venv is "
+        "explicitly active for the pip install, not just on PATH."
+    )
