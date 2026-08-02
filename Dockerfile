@@ -115,21 +115,19 @@ RUN set -Eeuo pipefail; \
         -i https://mirrors.aliyun.com/pypi/simple \
         -r /tmp/requirements-gpu.txt
 
-# Fail the build, not the first run, if the venv did not actually take. A bare
-# `python3` must be the venv interpreter and torch must import from it.
-#
-# DEBUG (temporary): split the two checks so the log shows which one fails and
-# the actual error. Also re-print PIP_CONSTRAINT here to confirm the ENV
-# clear reached this RUN. Remove once the import check passes.
+# Fail the build, not the first run, if the venv install did not actually
+# take. The check that matters is that torch loads FROM the venv's
+# site-packages -- NOT that `python3` resolves to /root/venv-ka/bin/python3.
+# On the NGC base image `command -v python3` returns /usr/bin/python3.12
+# (the venv's python3 symlink is not what the shell lookup finds), yet torch
+# still imports from /root/venv-ka/lib/python3.12/site-packages -- which is
+# the property we care about. The old readlink test was a false negative that
+# failed every build after the install itself succeeded.
 RUN set -Eeuo pipefail; \
-    echo "=== DEBUG[7/8]: python3 resolves to ==="; readlink -f "$(command -v python3)"; \
-    echo "=== DEBUG[7/8]: PIP_CONSTRAINT ==="; echo "PIP_CONSTRAINT=${PIP_CONSTRAINT:-<empty>}"; \
-    echo "=== DEBUG[7/8]: import torch ==="; python3 -c "import torch; print('torch', torch.__version__, torch.__file__)" 2>&1; \
-    echo "=== DEBUG[7/8]: import triton ==="; python3 -c "import triton; print('triton', triton.__version__, triton.__file__)" 2>&1; \
-    echo "=== DEBUG[7/8]: import numpy ==="; python3 -c "import numpy; print('numpy', numpy.__version__, numpy.__file__)" 2>&1; \
-    echo "=== DEBUG[7/8]: end ==="; \
-    test "$(readlink -f "$(command -v python3)")" = "/root/venv-ka/bin/python3"; \
-    python3 -c "import torch, triton, numpy; print('torch', torch.__version__, 'triton', triton.__version__)"
+    python3 -c "import torch, triton, numpy; \
+                assert torch.__file__.startswith('/root/venv-ka/'), \
+                    'torch not from venv: ' + torch.__file__; \
+                print('torch', torch.__version__, 'triton', triton.__version__, 'numpy', numpy.__version__)"
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

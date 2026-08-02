@@ -153,6 +153,29 @@ def test_dockerfile_prepends_venv_to_path(dockerfile_text: str):
     )
 
 
+def test_dockerfile_verify_checks_torch_sourced_from_venv(dockerfile_text: str):
+    # The verification RUN must assert torch loads from /root/venv-ka, not
+    # that `python3` resolves to /root/venv-ka/bin/python3. On the NGC base
+    # image `command -v python3` returns /usr/bin/python3.12 (the venv's
+    # python3 symlink is not what shell lookup finds), yet torch still imports
+    # from the venv's site-packages -- which is the property that matters.
+    # Pinning the python3 path was a false negative that failed every build
+    # after the install itself succeeded.
+    assert "torch.__file__.startswith('/root/venv-ka/')" in dockerfile_text, (
+        "Dockerfile verification must check torch loads from the venv "
+        "(/root/venv-ka/), not that python3 resolves to the venv interpreter."
+    )
+
+
+def test_dockerfile_verify_has_no_python3_path_test(dockerfile_text: str):
+    # The old `test "$(readlink -f ...)" = "/root/venv-ka/bin/python3"` check
+    # was a false negative on the NGC base and must not be present.
+    assert '"/root/venv-ka/bin/python3"' not in dockerfile_text, (
+        "Dockerfile must not assert python3 resolves to "
+        "/root/venv-ka/bin/python3 -- it is a false negative on the NGC base."
+    )
+
+
 def test_dockerfile_runs_python3_m_venv(dockerfile_text: str):
     assert "python3 -m venv" in dockerfile_text, (
         "Dockerfile must create the venv with stdlib `python3 -m venv`, not uv."
