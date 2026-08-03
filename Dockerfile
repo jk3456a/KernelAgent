@@ -109,10 +109,20 @@ ENV PIP_CONSTRAINT=
 # activate is per-shell -- it must run in this RUN, an earlier one would not
 # survive into it.
 COPY requirements-gpu.txt /tmp/requirements-gpu.txt
+# torch 2.6.0+cu124 declares triton==3.2.0, but we pin triton==3.7.1 (needed for
+# persistent warp-specialize, see memory/triton37-warp-specialize-persistent-128x256.md).
+# pip's strict resolver rejects that pair as ResolutionImpossible. Install torch
+# with --no-deps so pip skips its triton==3.2.0 constraint; every torch dep is
+# already pinned explicitly in requirements-gpu.txt and installed in the next step.
 RUN set -Eeuo pipefail; \
     source /root/venv-ka/bin/activate; \
+    pip install --no-cache-dir --no-deps \
+        --extra-index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.6.0+cu124; \
     pip install --no-cache-dir \
         -i https://mirrors.aliyun.com/pypi/simple \
+        --extra-index-url https://download.pytorch.org/whl/cu124 \
+        --no-deps \
         -r /tmp/requirements-gpu.txt
 
 # Fail the build, not the first run, if the venv install did not actually

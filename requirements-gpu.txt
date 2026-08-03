@@ -13,15 +13,11 @@
 #   3. triton 3.7.1 copied from venv-ka (cp -r triton triton-3.7.1.dist-info
 #      triton/third_party into site-packages)
 #
-# torch is pinned to the local wheel below (file:// URL); replace with
-#   torch==2.6.0  --index-url https://download.pytorch.org/whl/cu124
-# on a host with direct pytorch index access.
-# torch + nvidia-*-cu12 wheels resolve from the official PyTorch cu124 index
-# (extra-index-url below); the local-version tag 2.6.0+cu124 lives ONLY there,
-# not on any PyPI mirror. Pure-python deps (numpy, jinja2, ...) still resolve
-# from whatever -i the Dockerfile pip invocation points at (mirrors.aliyun.com).
---extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.6.0+cu124
+# torch is installed separately in the Dockerfile (pip install --no-deps
+# torch==2.6.0+cu124) to bypass its triton==3.2.0 constraint — we pin
+# triton==3.7.1 below for persistent warp-specialize support.
+# Every torch runtime dep is pinned explicitly below and installed via this
+# file with --no-deps, so nothing relies on torch's metadata to resolve.
 triton==3.7.1
 numpy==2.5.1
 filelock==3.32.2
