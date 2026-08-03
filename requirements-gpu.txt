@@ -16,6 +16,11 @@
 # torch is pinned to the local wheel below (file:// URL); replace with
 #   torch==2.6.0  --index-url https://download.pytorch.org/whl/cu124
 # on a host with direct pytorch index access.
+# torch + nvidia-*-cu12 wheels resolve from the official PyTorch cu124 index
+# (extra-index-url below); the local-version tag 2.6.0+cu124 lives ONLY there,
+# not on any PyPI mirror. Pure-python deps (numpy, jinja2, ...) still resolve
+# from whatever -i the Dockerfile pip invocation points at (mirrors.aliyun.com).
+--extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.6.0+cu124
 triton==3.7.1
 numpy==2.5.1
